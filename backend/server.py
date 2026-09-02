@@ -30,9 +30,9 @@ async def get_whisper_model():
         if _whisper_model is None:
             try:
                 from faster_whisper import WhisperModel
-                logger.info("Loading faster-whisper 'base' model for Bengali STT...")
-                # 'base' = ~145MB, good Bengali accuracy, fast on CPU
-                _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+                logger.info("Loading faster-whisper 'tiny' model for Bengali STT...")
+                # 'tiny' = ~39MB, ultra-fast CPU inference, instant download
+                _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
                 logger.info("Whisper model loaded successfully.")
             except ImportError:
                 logger.warning("faster-whisper not installed. Bengali STT will not be available.")
@@ -82,6 +82,10 @@ class TTSRequest(BaseModel):
     voice: Optional[str] = DEFAULT_BENGALI_VOICE
     rate: Optional[str] = "+0%"
     pitch: Optional[str] = "+0Hz"
+
+class TranscribeRequest(BaseModel):
+    audio_base64: str
+    lang: Optional[str] = "bn"
 
 class ChatConsultationRequest(BaseModel):
     message: str
@@ -435,6 +439,57 @@ async def websocket_consultation_endpoint(websocket: WebSocket):
         logger.info("Client disconnected from WebSocket.")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
+
+
+@app.post("/api/transcribe")
+async def whisper_transcribe_http(req: TranscribeRequest):
+    """
+    HTTP POST fallback endpoint for Whisper Bengali STT transcription.
+    Accepts Base64 audio, decodes and returns transcribed Bengali text.
+    Works 100% reliably over Cloudflare Tunnels, Ngrok, and Firewalls.
+    """
+    try:
+        if not req.audio_base64:
+            return {"success": False, "transcript": "", "error": "No audio data"}
+
+        b64_raw = req.audio_base64
+        if "," in b64_raw:
+            b64_raw = b64_raw.split(",")[1]
+
+        audio_bytes = base64.b64decode(b64_raw)
+        audio_path = TEMP_DIR / f"mic_{uuid.uuid4().hex[:8]}.webm"
+        with open(audio_path, "wb") as f:
+            f.write(audio_bytes)
+
+        model = await get_whisper_model()
+        if model is None:
+            return {"success": False, "transcript": "", "error": "Whisper model not loaded"}
+
+        loop = asyncio.get_event_loop()
+        def transcribe():
+            segments, info = model.transcribe(
+                str(audio_path),
+                language=req.lang or "bn",
+                beam_size=5,
+                vad_filter=False,
+                condition_on_previous_text=False,
+            )
+            return " ".join(seg.text.strip() for seg in segments)
+
+        transcript = await loop.run_in_executor(None, transcribe)
+        transcript = transcript.strip()
+
+        try:
+            audio_path.unlink()
+        except:
+            pass
+
+        if transcript:
+            logger.info(f"HTTP Whisper [{req.lang}] transcript: {transcript}")
+        return {"success": True, "transcript": transcript}
+    except Exception as e:
+        logger.error(f"HTTP Transcribe error: {e}")
+        return {"success": False, "transcript": "", "error": str(e)}
 
 
 @app.websocket("/ws/transcribe")

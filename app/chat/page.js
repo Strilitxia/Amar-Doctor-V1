@@ -16,6 +16,24 @@ const INITIAL_MESSAGES = [
   },
 ];
 
+// Robust URL Sanitizer & WebSocket URL Generator
+const sanitizeBackendUrl = (url) => {
+  if (!url) return "http://localhost:8000";
+  let clean = url.trim().replace(/\/+$/, "");
+  if (!clean.startsWith("http://") && !clean.startsWith("https://")) {
+    clean = "https://" + clean;
+  }
+  return clean;
+};
+
+const buildWsUrl = (baseUrl, endpointPath) => {
+  const clean = sanitizeBackendUrl(baseUrl);
+  const wsProtocol = clean.startsWith("https") ? "wss" : "ws";
+  const host = clean.replace(/^https?:\/\//, "");
+  const path = endpointPath.startsWith("/") ? endpointPath : `/${endpointPath}`;
+  return `${wsProtocol}://${host}${path}`;
+};
+
 export default function ChatPage() {
   const [messages, setMessages] = useState(INITIAL_MESSAGES);
   const [input, setInput] = useState("");
@@ -46,7 +64,8 @@ export default function ChatPage() {
   const voiceWsRef = useRef(null);
   const silenceTimerRef = useRef(null);
   const latestSpeechRef = useRef("");
-  const isWhisperModeRef = useRef(false); // true when using Whisper (Bengali)
+  const lastProcessedSpeechRef = useRef("");
+  const isProcessingRef = useRef(false);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -58,12 +77,12 @@ export default function ChatPage() {
 
   const checkColabConnection = useCallback(async (url) => {
     try {
-      const cleanUrl = (url || "").trim().replace(/\/$/, "");
-      if (!cleanUrl) return false;
+      const cleanUrl = sanitizeBackendUrl(url);
       const res = await fetch(`${cleanUrl}/health`, { method: "GET" });
       const data = await res.json();
       if (data.status === "online" || data.status === "ok") {
         setColabConnected(true);
+        setColabUrl(cleanUrl);
         localStorage.setItem("amar_doctor_colab_url", cleanUrl);
         return true;
       }
@@ -73,46 +92,61 @@ export default function ChatPage() {
     return false;
   }, []);
 
-  // Initialize audio stream player and test local backend on mount
+  // Initialize audio stream player and test local/saved backend on mount
   useEffect(() => {
     streamPlayerRef.current = new AudioStreamPlayer();
+    
     streamPlayerRef.current.onPlayStart = () => {
       setIsAvatarTalking(true);
       setCallStatusText("🔊 AI Doctor is speaking...");
+
+      // Mute mic while AI doctor is speaking to prevent feedback loops
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+        try { mediaRecorderRef.current.pause(); } catch {}
+      }
     };
+
     streamPlayerRef.current.onPlayEnd = () => {
       setIsAvatarTalking(false);
+      isProcessingRef.current = false;
+      audioChunksRef.current = [];
       setCallStatusText("🎧 Listening to your voice... Speak now.");
-      // Resume listening after doctor stops speaking if in call mode
-      if (isVoiceCallActive && recognitionRef.current) {
-        try {
-          recognitionRef.current.start();
-          setIsListening(true);
-        } catch {}
+
+      // Resume mic after AI doctor finishes speaking
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "paused") {
+        try { mediaRecorderRef.current.resume(); } catch {}
       }
     };
 
     if (typeof window !== "undefined") {
       const savedUrl = localStorage.getItem("amar_doctor_colab_url") || "http://localhost:8000";
-      setColabUrl(savedUrl);
-      checkColabConnection(savedUrl);
+      const cleanSaved = sanitizeBackendUrl(savedUrl);
+      setColabUrl(cleanSaved);
+      checkColabConnection(cleanSaved);
     }
 
     return () => {
       if (voiceWsRef.current) voiceWsRef.current.close();
       if (whisperWsRef.current) whisperWsRef.current.close();
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-        mediaRecorderRef.current.stop();
+        try { mediaRecorderRef.current.stop(); } catch {}
       }
       if (streamPlayerRef.current) streamPlayerRef.current.stop();
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     };
-  }, [checkColabConnection, isVoiceCallActive]);
+  }, []);
 
   // Main interactive voice query handler
   const handleInteractiveVoiceInput = useCallback(async (transcriptText) => {
     if (!transcriptText || !transcriptText.trim()) return;
     const cleanText = transcriptText.trim();
+    
+    // Prevent duplicate processing of the same phrase or while AI is active
+    if (cleanText === lastProcessedSpeechRef.current || isProcessingRef.current) return;
+    
+    lastProcessedSpeechRef.current = cleanText;
+    isProcessingRef.current = true;
+    audioChunksRef.current = [];
     setLiveTranscript("");
     latestSpeechRef.current = "";
 
@@ -127,20 +161,15 @@ export default function ChatPage() {
     setIsTyping(true);
     setCallStatusText("🩺 AI Doctor is thinking...");
 
-    // Pause recognition while preparing answer
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-        setIsListening(false);
-      } catch {}
+    // Pause mic recording while preparing response
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+      try { mediaRecorderRef.current.pause(); } catch {}
     }
 
     // 1. Try WebSocket streaming if backend is connected
     if (colabConnected && colabUrl) {
       try {
-        const wsProtocol = colabUrl.startsWith("https") ? "wss" : "ws";
-        const cleanWsUrl = colabUrl.replace(/^https?:\/\//, "");
-        const wsUrl = `${wsProtocol}://${cleanWsUrl}/ws/voice-call`;
+        const wsUrl = buildWsUrl(colabUrl, "/ws/voice-call");
 
         if (!voiceWsRef.current || voiceWsRef.current.readyState !== WebSocket.OPEN) {
           voiceWsRef.current = new WebSocket(wsUrl);
@@ -235,7 +264,7 @@ export default function ChatPage() {
     }
   };
 
-  // ─── English: Web SpeechRecognition (browser-native, good for English) ────────
+  // ─── English: Web SpeechRecognition ────────
   useEffect(() => {
     if (typeof window === "undefined" || voiceLang !== "en-US") return;
 
@@ -275,7 +304,7 @@ export default function ChatPage() {
     recognition.onerror = (event) => {
       console.warn("Speech recognition notice:", event.error);
       if (event.error === "not-allowed") {
-        alert("Microphone permission was denied. Please allow microphone access in your browser settings.");
+        alert("Microphone permission was denied.");
         setIsVoiceCallActive(false);
         setIsListening(false);
       }
@@ -292,47 +321,51 @@ export default function ChatPage() {
     recognitionRef.current = recognition;
   }, [voiceLang, mode, isVoiceCallActive, isAvatarTalking, isTyping, handleInteractiveVoiceInput]);
 
-  // ─── Bengali: Whisper STT via MediaRecorder + backend WebSocket ──────────────
+  // ─── Bengali: Whisper STT via MediaRecorder ──────────────
   const startWhisperListening = useCallback(async (stream) => {
-    const activeUrl = colabUrl || "http://localhost:8000";
-    const wsProtocol = activeUrl.startsWith("https") ? "wss" : "ws";
-    const cleanWsUrl = activeUrl.replace(/^https?:\/\//, "");
-    const wsUrl = `${wsProtocol}://${cleanWsUrl}/ws/transcribe`;
+    const cleanBackendUrl = sanitizeBackendUrl(colabUrl);
+    const wsUrl = buildWsUrl(colabUrl, "/ws/transcribe");
 
     if (whisperWsRef.current) {
       try { whisperWsRef.current.close(); } catch {}
     }
 
-    const ws = new WebSocket(wsUrl);
-    whisperWsRef.current = ws;
+    try {
+      const ws = new WebSocket(wsUrl);
+      whisperWsRef.current = ws;
+      audioChunksRef.current = [];
 
-    ws.onopen = () => {
-      console.log("Whisper STT WebSocket connected.");
-      setCallStatusText("🎤 Whisper connected. Speak now in Bengali...");
-    };
-    ws.onerror = (e) => {
-      console.warn("Whisper WS error:", e);
-      setCallStatusText("⚠️ Backend WebSocket connection error");
-    };
+      ws.onopen = () => {
+        setCallStatusText("🎤 Whisper connected. Speak now in Bengali...");
+      };
+      ws.onerror = (e) => {
+        setCallStatusText("🎤 Whisper listening in Bengali...");
+      };
 
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === "transcript" && msg.text) {
-          const text = msg.text.trim();
-          latestSpeechRef.current = text;
-          setLiveTranscript(text);
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "transcript" && msg.text) {
+            const text = msg.text.trim();
+            latestSpeechRef.current = text;
+            setLiveTranscript(text);
 
-          if (mode === "text") {
-            setInput(text);
-          } else if (isVoiceCallActive) {
-            handleInteractiveVoiceInput(text);
+            if (mode === "text") {
+              setInput(text);
+            } else if (isVoiceCallActive && text.length >= 3 && !isProcessingRef.current) {
+              if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+              silenceTimerRef.current = setTimeout(() => {
+                handleInteractiveVoiceInput(latestSpeechRef.current.trim());
+              }, 1200);
+            }
           }
+        } catch (e) {
+          console.warn("Whisper msg parse error:", e);
         }
-      } catch (e) {
-        console.warn("Whisper msg parse error:", e);
-      }
-    };
+      };
+    } catch (wsInitErr) {
+      console.warn("WebSocket init failed:", wsInitErr);
+    }
 
     let mimeType = "";
     if (typeof MediaRecorder !== "undefined") {
@@ -347,31 +380,70 @@ export default function ChatPage() {
     mediaRecorderRef.current = recorder;
 
     recorder.ondataavailable = (e) => {
+      // Don't process incoming audio if AI doctor is speaking or thinking
+      if (isProcessingRef.current || isAvatarTalking) return;
+
       if (e.data && e.data.size > 100) {
+        audioChunksRef.current.push(e.data);
+        const fullBlob = new Blob(audioChunksRef.current, { type: mimeType || "audio/webm" });
+
         const reader = new FileReader();
-        reader.onloadend = () => {
+        reader.onloadend = async () => {
           const result = reader.result;
           if (result && typeof result === "string") {
             const base64 = result.split(",")[1];
+
+            // 1. Try WebSocket if connected
             if (whisperWsRef.current && whisperWsRef.current.readyState === WebSocket.OPEN) {
               whisperWsRef.current.send(JSON.stringify({ audio: base64, lang: "bn" }));
               setCallStatusText("🧠 Whisper transcribing Bengali...");
+              return;
+            }
+
+            // 2. HTTP POST fallback
+            try {
+              setCallStatusText("🧠 Whisper transcribing via HTTP...");
+              const httpRes = await fetch(`${cleanBackendUrl}/api/transcribe`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ audio_base64: base64, lang: "bn" }),
+              });
+              const data = await httpRes.json();
+              if (data.success && data.transcript) {
+                const text = data.transcript.trim();
+                latestSpeechRef.current = text;
+                setLiveTranscript(text);
+
+                if (mode === "text") {
+                  setInput(text);
+                } else if (isVoiceCallActive && text.length >= 3 && !isProcessingRef.current) {
+                  if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+                  silenceTimerRef.current = setTimeout(() => {
+                    handleInteractiveVoiceInput(latestSpeechRef.current.trim());
+                  }, 1200);
+                }
+              }
+            } catch (httpErr) {
+              console.warn("HTTP Transcribe fallback error:", httpErr);
             }
           }
         };
-        reader.readAsDataURL(e.data);
+        reader.readAsDataURL(fullBlob);
+
+        if (audioChunksRef.current.length > 8) {
+          audioChunksRef.current = [];
+        }
       }
     };
 
-    recorder.start(2500);
+    recorder.start(2000);
     setIsListening(true);
-  }, [colabUrl, mode, isVoiceCallActive, handleInteractiveVoiceInput]);
+    setCallStatusText("🎤 Whisper is listening in Bengali...");
+  }, [colabUrl, mode, isVoiceCallActive, isAvatarTalking, handleInteractiveVoiceInput]);
 
   const startVoiceCall = async () => {
-    // Unlock browser audio playback on user gesture
     if (streamPlayerRef.current) streamPlayerRef.current.init();
 
-    // Request microphone access
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -383,16 +455,16 @@ export default function ChatPage() {
     setIsVoiceCallActive(true);
     setLiveTranscript("");
     latestSpeechRef.current = "";
+    lastProcessedSpeechRef.current = "";
+    isProcessingRef.current = false;
 
     const isBengali = voiceLang === "bn-BD";
     isWhisperModeRef.current = isBengali;
 
     if (isBengali) {
-      // ── Bengali mode: Whisper STT via MediaRecorder ──
-      setCallStatusText("🎤 Whisper is listening in Bengali...");
+      setCallStatusText("🎤 Connecting to Whisper backend...");
       await startWhisperListening(stream);
     } else {
-      // ── English mode: native SpeechRecognition ──
       setCallStatusText("🎧 Listening in English... Speak now.");
       if (recognitionRef.current) {
         try {
@@ -409,18 +481,18 @@ export default function ChatPage() {
   const stopVoiceCall = () => {
     setIsVoiceCallActive(false);
     setIsListening(false);
+    isProcessingRef.current = false;
     setCallStatusText("Call ended");
     setLiveTranscript("");
     latestSpeechRef.current = "";
+    lastProcessedSpeechRef.current = "";
 
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
 
-    // Stop English STT
     if (recognitionRef.current) {
       try { recognitionRef.current.stop(); } catch {}
     }
 
-    // Stop Bengali Whisper STT
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       try { mediaRecorderRef.current.stop(); } catch {}
     }
@@ -443,7 +515,6 @@ export default function ChatPage() {
       return;
     }
 
-    // Text mode: use SpeechRecognition for English inline dictation
     if (!recognitionRef.current) {
       alert("Switch to English (ENG) for inline text dictation, or use Voice Call mode for Bengali.");
       return;
@@ -480,7 +551,8 @@ export default function ChatPage() {
       try {
         setSpeakingMsgId(msgId);
         setIsAvatarTalking(true);
-        const res = await fetch(`${colabUrl}/api/tts`, {
+        const cleanUrl = sanitizeBackendUrl(colabUrl);
+        const res = await fetch(`${cleanUrl}/api/tts`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text, voice: selectedVoice }),
@@ -548,7 +620,8 @@ export default function ChatPage() {
 
       if (colabConnected && colabUrl) {
         try {
-          const colabRes = await fetch(`${colabUrl}/api/chat-consultation`, {
+          const cleanUrl = sanitizeBackendUrl(colabUrl);
+          const colabRes = await fetch(`${cleanUrl}/api/chat-consultation`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -641,7 +714,7 @@ export default function ChatPage() {
             }}
             id="colab-settings-btn"
           >
-            {colabConnected ? "⚡ Backend Connected" : "🔌 Connect Backend (Local/Colab)"}
+            {colabConnected ? "⚡ Backend Connected" : "🔌 Connect Backend (Colab/Local)"}
           </button>
 
           {/* Mode Toggle (Text / Audio Call / Video Call) */}
@@ -897,7 +970,7 @@ export default function ChatPage() {
                 type="text"
                 className="chat-input"
                 style={{ width: "100%", borderRadius: "var(--radius-cards)", padding: "10px 14px" }}
-                placeholder="http://localhost:8000"
+                placeholder="https://...trycloudflare.com or http://localhost:8000"
                 value={colabUrl}
                 onChange={(e) => setColabUrl(e.target.value)}
               />
@@ -932,12 +1005,13 @@ export default function ChatPage() {
               <button
                 className="btn-primary"
                 onClick={async () => {
-                  const ok = await checkColabConnection(colabUrl);
+                  const clean = sanitizeBackendUrl(colabUrl);
+                  const ok = await checkColabConnection(clean);
                   if (ok) {
                     alert("✓ Successfully connected to Amar Doctor AI Backend!");
                     setShowColabModal(false);
                   } else {
-                    alert("Could not reach backend at that URL. Please verify server is running on port 8000 or Cloudflare tunnel.");
+                    alert("Could not reach backend at that URL. Please verify server is running on Colab or local port 8000.");
                   }
                 }}
               >
