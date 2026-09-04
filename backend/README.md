@@ -34,3 +34,31 @@ pip install -r backend/requirements.txt
 python -m uvicorn backend.server:app --reload --port 8000
 ```
 Server will be live on `http://localhost:8000`. Test docs at `http://localhost:8000/docs`.
+
+---
+
+## 🗣️ Speech-to-Text: Web Speech API (primary) + Whisper (fallback)
+
+Voice-call transcription primarily uses the browser's own Web Speech API
+(Chrome/Android's built-in cloud recognizer) — it's far more accurate on
+Bengali than a small self-hosted model, and has no round-trip to this
+backend at all. This server's `faster-whisper` model is only used as an
+**automatic fallback** for browsers without that API (Firefox, Safari) or
+when it fails for the requested language.
+
+Because it's now a fallback tier rather than the primary path, model size
+defaults to accuracy over raw speed, auto-selected by GPU availability:
+
+| Env var | Default | Notes |
+|---|---|---|
+| `WHISPER_MODEL_SIZE` | `small` on GPU, `base` on CPU | `tiny` is noticeably weak on Bengali — avoid it unless you need the absolute smallest download. `small`/`medium` on CPU-only will run several times slower than real-time; a warning is logged if you set that combination. |
+| `WHISPER_DEVICE` | `cuda` if available, else `cpu` | |
+| `WHISPER_COMPUTE_TYPE` | `float16` on GPU, `int8` on CPU | |
+
+Example (Colab cell, before starting the server):
+```python
+%env WHISPER_MODEL_SIZE=small
+```
+
+The model is warmed up in the background at server startup so the first
+real utterance of a call doesn't pay the model download/load cost.

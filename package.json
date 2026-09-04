@@ -10,8 +10,10 @@
   },
   "dependencies": {
     "@googlemaps/js-api-loader": "^2.1.1",
+    "@ricky0123/vad-web": "^0.0.30",
     "leaflet": "^1.9.4",
     "next": "16.3.3",
+    "onnxruntime-web": "^1.19.2",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },

@@ -19,7 +19,14 @@ from pathlib import Path
 
 import edge_tts
 
-# Lazy-loaded Whisper model for Bengali speech recognition
+# Lazy-loaded Whisper model — this is now only the FALLBACK STT tier (the
+# frontend's primary transcription path is the browser's own Web Speech API;
+# Whisper only runs for browsers that lack it, e.g. Firefox/Safari). Model
+# size/device/compute-type are env-configurable since "tiny" (the old
+# hardcoded default) is known to be weak specifically on Bengali. Defaults:
+# "small" on GPU (fast + noticeably more accurate), "base" on CPU-only (the
+# safe ceiling — "small" on CPU-only would run several times slower than
+# real time, unusable in a live call).
 _whisper_model = None
 _whisper_model_lock = asyncio.Lock()
 
@@ -32,16 +39,39 @@ async def get_whisper_model():
                 from faster_whisper import WhisperModel
                 import torch
                 cuda_available = torch.cuda.is_available()
-                device = "cuda" if cuda_available else "cpu"
-                compute_type = "float16" if cuda_available else "int8"
-                logger.info(f"Loading faster-whisper 'tiny' model on {device} ({compute_type})...")
-                # 'tiny' = ~39MB, ultra-fast inference
-                _whisper_model = WhisperModel("tiny", device=device, compute_type=compute_type)
+                device = os.environ.get("WHISPER_DEVICE") or ("cuda" if cuda_available else "cpu")
+                compute_type = os.environ.get("WHISPER_COMPUTE_TYPE") or ("float16" if cuda_available else "int8")
+                model_size = os.environ.get("WHISPER_MODEL_SIZE") or ("small" if cuda_available else "base")
+
+                if model_size in ("small", "medium", "large-v3") and device == "cpu":
+                    logger.warning(
+                        f"WHISPER_MODEL_SIZE={model_size} on CPU will be slow (several x real-time). "
+                        "Consider 'base' or 'tiny' for CPU-only deployments, or set WHISPER_MODEL_SIZE=base."
+                    )
+
+                kwargs = {"cpu_threads": os.cpu_count()} if device == "cpu" else {}
+                logger.info(f"Loading faster-whisper '{model_size}' model on {device} ({compute_type})...")
+                _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type, **kwargs)
                 logger.info(f"Whisper model loaded successfully on {device}.")
             except ImportError:
                 logger.warning("faster-whisper not installed. Bengali STT will not be available.")
                 _whisper_model = None
     return _whisper_model
+
+
+def whisper_model_info():
+    global _whisper_model
+    cuda_available = False
+    try:
+        import torch
+        cuda_available = torch.cuda.is_available()
+    except Exception:
+        pass
+    return {
+        "model_size": os.environ.get("WHISPER_MODEL_SIZE") or ("small" if cuda_available else "base"),
+        "device": os.environ.get("WHISPER_DEVICE") or ("cuda" if cuda_available else "cpu"),
+        "loaded": _whisper_model is not None,
+    }
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
@@ -65,6 +95,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def _warmup_whisper_model():
+    # Kick off model load in the background so the first real utterance on
+    # the Whisper fallback tier doesn't pay the download/load cost — this
+    # can be a ~460MB first-run download for the "small" model on Colab.
+    asyncio.create_task(get_whisper_model())
 
 # Configuration Constants
 DEFAULT_BENGALI_VOICE = "bn-BD-NabanitaNeural"  # High quality female Bengali neural voice
@@ -90,6 +128,7 @@ class TTSRequest(BaseModel):
 class TranscribeRequest(BaseModel):
     audio_base64: str
     lang: Optional[str] = "bn"
+    format: Optional[str] = "webm"  # "webm" (Opus, from MediaRecorder) or "wav" (from the VAD segmenter)
 
 class ChatConsultationRequest(BaseModel):
     message: str
@@ -161,6 +200,7 @@ async def health_check():
         "status": "online",
         "service": "Amar Doctor V1 AI Video & Neural Voice Sandbox",
         "gpu": gpu,
+        "whisper": whisper_model_info(),
         "supported_voices": [
             {"id": "bn-BD-NabanitaNeural", "name": "Nabanita (Bengali Female)", "lang": "bn-BD"},
             {"id": "bn-BD-PradeepNeural", "name": "Pradeep (Bengali Male)", "lang": "bn-BD"},
@@ -457,12 +497,90 @@ async def websocket_consultation_endpoint(websocket: WebSocket):
         logger.error(f"WebSocket error: {e}")
 
 
+def _transcribe_sync(model, source, lang, cuda_available):
+    """
+    Runs faster-whisper on `source` (a file-like object or a path string) and
+    applies server-side anti-hallucination filtering. faster-whisper — the
+    "tiny"/"base" models especially — can emit confident-looking short
+    phrases from pure silence or background noise; no_speech_prob/avg_logprob
+    catch most of these before they ever reach the frontend. This matters a
+    lot more now that transcription requests are paced by real VAD/endpoint
+    events rather than fixed timers: a stray hallucinated segment used to be
+    exactly what kept the old client-side "silence" timer from ever elapsing.
+    """
+    segments, info = model.transcribe(
+        source,
+        language=lang or "bn",
+        beam_size=5 if cuda_available else 1,
+        best_of=1,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=400),
+        condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        log_prob_threshold=-1.0,
+    )
+    kept = [
+        seg.text.strip()
+        for seg in segments
+        if seg.no_speech_prob <= 0.6 and seg.avg_logprob >= -1.0
+    ]
+    return " ".join(kept).strip()
+
+
+async def _run_whisper(audio_bytes: bytes, lang: str, fmt: str = "webm") -> str:
+    """
+    Shared transcription path for both /api/transcribe and /ws/transcribe.
+    `fmt == "wav"` (from the VAD segmenter) is always a clean, complete,
+    valid file, so it's decoded in-memory with no fallback needed. `fmt ==
+    "webm"` (MediaRecorder / energy-VAD fallback) tries in-memory decode
+    first and falls back to a temp file, since some av/ffmpeg builds need a
+    real seekable file for certain webm streams.
+    """
+    model = await get_whisper_model()
+    if model is None:
+        raise RuntimeError("Whisper model not loaded")
+
+    cuda_available = False
+    try:
+        import torch
+        cuda_available = torch.cuda.is_available()
+    except Exception:
+        pass
+
+    loop = asyncio.get_event_loop()
+
+    if fmt == "wav":
+        def transcribe():
+            return _transcribe_sync(model, io.BytesIO(audio_bytes), lang, cuda_available)
+        return await loop.run_in_executor(None, transcribe)
+
+    def transcribe():
+        audio_stream = io.BytesIO(audio_bytes)
+        try:
+            return _transcribe_sync(model, audio_stream, lang, cuda_available)
+        except Exception as stream_err:
+            logger.warning(f"In-memory transcription fallback to temp file: {stream_err}")
+            temp_p = TEMP_DIR / f"mic_{uuid.uuid4().hex[:8]}.webm"
+            with open(temp_p, "wb") as f:
+                f.write(audio_bytes)
+            try:
+                return _transcribe_sync(model, str(temp_p), lang, cuda_available)
+            finally:
+                try:
+                    temp_p.unlink()
+                except Exception:
+                    pass
+
+    return await loop.run_in_executor(None, transcribe)
+
+
 @app.post("/api/transcribe")
 async def whisper_transcribe_http(req: TranscribeRequest):
     """
-    HTTP POST fallback endpoint for Whisper Bengali STT transcription.
-    Accepts Base64 audio, decodes in-memory and returns transcribed Bengali text with low-latency greedy decoding.
-    Works 100% reliably over Cloudflare Tunnels, Ngrok, and Firewalls.
+    HTTP POST fallback endpoint for Whisper STT transcription (self-hosted
+    fallback tier — the primary transcription path is the browser's own Web
+    Speech API). Accepts Base64 audio (webm or wav) and returns transcribed
+    text. Works reliably over Cloudflare Tunnels, Ngrok, and firewalls.
     """
     try:
         if not req.audio_base64:
@@ -471,53 +589,9 @@ async def whisper_transcribe_http(req: TranscribeRequest):
         b64_raw = req.audio_base64
         if "," in b64_raw:
             b64_raw = b64_raw.split(",")[1]
-
         audio_bytes = base64.b64decode(b64_raw)
-        audio_stream = io.BytesIO(audio_bytes)
 
-        model = await get_whisper_model()
-        if model is None:
-            return {"success": False, "transcript": "", "error": "Whisper model not loaded"}
-
-        loop = asyncio.get_event_loop()
-        def transcribe():
-            try:
-                audio_stream.seek(0)
-                segments, info = model.transcribe(
-                    audio_stream,
-                    language=req.lang or "bn",
-                    beam_size=1,
-                    best_of=1,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=400),
-                    condition_on_previous_text=False,
-                )
-                return " ".join(seg.text.strip() for seg in segments)
-            except Exception as stream_err:
-                logger.warning(f"In-memory transcription fallback to temp file: {stream_err}")
-                temp_p = TEMP_DIR / f"mic_{uuid.uuid4().hex[:8]}.webm"
-                with open(temp_p, "wb") as f:
-                    f.write(audio_bytes)
-                try:
-                    segments, info = model.transcribe(
-                        str(temp_p),
-                        language=req.lang or "bn",
-                        beam_size=1,
-                        best_of=1,
-                        vad_filter=True,
-                        vad_parameters=dict(min_silence_duration_ms=400),
-                        condition_on_previous_text=False,
-                    )
-                    return " ".join(seg.text.strip() for seg in segments)
-                finally:
-                    try:
-                        temp_p.unlink()
-                    except:
-                        pass
-
-        transcript = await loop.run_in_executor(None, transcribe)
-        transcript = transcript.strip()
-
+        transcript = await _run_whisper(audio_bytes, req.lang, req.format or "webm")
         if transcript:
             logger.info(f"HTTP Whisper [{req.lang}] transcript: {transcript}")
         return {"success": True, "transcript": transcript}
@@ -529,80 +603,33 @@ async def whisper_transcribe_http(req: TranscribeRequest):
 @app.websocket("/ws/transcribe")
 async def whisper_transcribe_endpoint(websocket: WebSocket):
     """
-    Real-time Bengali speech transcription via faster-whisper.
-    Browser sends raw audio bytes (webm/ogg/wav), backend returns Bengali text with low-latency greedy decoding.
+    Real-time STT via faster-whisper (self-hosted fallback tier). Browser
+    sends audio (webm/opus or wav), backend returns transcribed text.
     """
     await websocket.accept()
     logger.info("Whisper STT WebSocket connected.")
     try:
         while True:
-            # Receive audio payload: {"audio": "<base64>", "lang": "bn"}
+            # Receive audio payload: {"audio": "<base64>", "lang": "bn", "format": "wav"|"webm"}
             data = await websocket.receive_text()
             payload = json.loads(data)
             audio_b64 = payload.get("audio", "")
-            lang = payload.get("lang", "bn")  # "bn" for Bengali, "en" for English
+            lang = payload.get("lang", "bn")
+            fmt = payload.get("format", "webm")
 
             if not audio_b64:
                 await websocket.send_json({"type": "error", "error": "No audio data received"})
                 continue
 
-            # Decode base64 audio in-memory
             audio_data = base64.b64decode(audio_b64)
-            audio_stream = io.BytesIO(audio_data)
-
-            # Run Whisper transcription
-            model = await get_whisper_model()
-            if model is None:
-                await websocket.send_json({"type": "error", "error": "Whisper model not available. Run: pip install faster-whisper"})
-                continue
 
             try:
-                # Run in thread pool to avoid blocking the event loop
-                loop = asyncio.get_event_loop()
-                def transcribe():
-                    try:
-                        audio_stream.seek(0)
-                        segments, info = model.transcribe(
-                            audio_stream,
-                            language=lang,
-                            beam_size=1,
-                            best_of=1,
-                            vad_filter=True,
-                            vad_parameters=dict(min_silence_duration_ms=400),
-                            condition_on_previous_text=False,
-                        )
-                        return " ".join(seg.text.strip() for seg in segments)
-                    except Exception as stream_err:
-                        logger.warning(f"In-memory transcription fallback to temp file: {stream_err}")
-                        temp_p = TEMP_DIR / f"mic_{uuid.uuid4().hex[:8]}.webm"
-                        with open(temp_p, "wb") as f:
-                            f.write(audio_data)
-                        try:
-                            segments, info = model.transcribe(
-                                str(temp_p),
-                                language=lang,
-                                beam_size=1,
-                                best_of=1,
-                                vad_filter=True,
-                                vad_parameters=dict(min_silence_duration_ms=400),
-                                condition_on_previous_text=False,
-                            )
-                            return " ".join(seg.text.strip() for seg in segments)
-                        finally:
-                            try:
-                                temp_p.unlink()
-                            except:
-                                pass
-
-                transcript = await loop.run_in_executor(None, transcribe)
-                transcript = transcript.strip()
-
+                transcript = await _run_whisper(audio_data, lang, fmt)
                 if transcript:
                     logger.info(f"Whisper [{lang}] transcript: {transcript}")
                     await websocket.send_json({"type": "transcript", "text": transcript, "lang": lang})
                 else:
                     await websocket.send_json({"type": "empty", "text": ""})
-
             except Exception as transcribe_err:
                 logger.error(f"Whisper transcription error: {transcribe_err}")
                 await websocket.send_json({"type": "error", "error": str(transcribe_err)})

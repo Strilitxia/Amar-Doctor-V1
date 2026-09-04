@@ -55,19 +55,32 @@ export default function ChatPage() {
 
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
-  const recognitionRef = useRef(null);   // English SpeechRecognition
-  const mediaRecorderRef = useRef(null); // Bengali Whisper MediaRecorder (current segment)
-  const mediaStreamRef = useRef(null);   // Live mic MediaStream, reused across segments
-  const segmentActiveRef = useRef(false); // Whether the record-segment loop should keep going
-  const whisperWsRef = useRef(null);     // Bengali Whisper WebSocket
+  const recognitionRef = useRef(null);   // Web Speech SpeechRecognition (bn-BD or en-US)
+  const mediaStreamRef = useRef(null);   // Live mic MediaStream (Whisper/VAD fallback tier only)
+  const whisperWsRef = useRef(null);     // Whisper fallback WebSocket
+  const vadRef = useRef(null);           // Active VAD segmenter handle (Whisper fallback tier)
   const audioPlayerRef = useRef(null);
   const streamPlayerRef = useRef(null);
   const voiceWsRef = useRef(null);
-  const silenceTimerRef = useRef(null);
   const latestSpeechRef = useRef("");
-  const lastProcessedSpeechRef = useRef("");
+  const lastProcessedSpeechRef = useRef({ text: "", at: 0 });
   const isProcessingRef = useRef(false);
-  const isWhisperModeRef = useRef(false);
+
+  // Natural-conversation plumbing
+  const handleTurnRef = useRef(null);        // always points at the latest handleInteractiveVoiceInput
+  const activeTurnIdRef = useRef(0);         // turn-id guard: an interrupted turn's late WS messages
+                                              // (audio_chunk/response_complete) are dropped once stale
+  const sttEngineRef = useRef(null);         // "webspeech" | "whisper" — decided per call session
+  const finalTranscriptRef = useRef("");     // accumulated isFinal chunks for the current utterance
+  const endOfTurnTimerRef = useRef(null);    // armed ONLY by isFinal results (real endpointing)
+  const webSpeechRetryRef = useRef(0);       // transient "network" error retry counter
+  const recognitionStartedRef = useRef(false);
+  const isAvatarTalkingRef = useRef(false);  // ref-mirrors so async/event callbacks never read stale state
+  const isVoiceCallActiveRef = useRef(false);
+  const modeRef = useRef("text");
+  const voiceLangRef = useRef("bn-BD");
+
+  const [sttEngine, setSttEngine] = useState(null); // UI badge: which STT engine is currently live
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -76,6 +89,11 @@ export default function ChatPage() {
   useEffect(() => {
     scrollToBottom();
   }, [messages, isTyping, liveTranscript]);
+
+  useEffect(() => { isAvatarTalkingRef.current = isAvatarTalking; }, [isAvatarTalking]);
+  useEffect(() => { isVoiceCallActiveRef.current = isVoiceCallActive; }, [isVoiceCallActive]);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { voiceLangRef.current = voiceLang; }, [voiceLang]);
 
   const checkColabConnection = useCallback(async (url) => {
     try {
@@ -101,8 +119,8 @@ export default function ChatPage() {
     streamPlayerRef.current.onPlayStart = () => {
       setIsAvatarTalking(true);
       setCallStatusText("🔊 AI Doctor is speaking...");
-      // Segment recorder keeps running; segments recorded while talking are
-      // simply discarded (see onstop handler) to prevent feedback loops.
+      // The mic/recognizer stays fully active while the AI talks — that's
+      // what makes barge-in possible (see interruptAiTurn below).
     };
 
     streamPlayerRef.current.onPlayEnd = () => {
@@ -119,32 +137,41 @@ export default function ChatPage() {
     }
 
     return () => {
-      segmentActiveRef.current = false;
       if (voiceWsRef.current) voiceWsRef.current.close();
       if (whisperWsRef.current) whisperWsRef.current.close();
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-        try { mediaRecorderRef.current.stop(); } catch {}
+      if (vadRef.current) { try { vadRef.current.destroy(); } catch {} }
+      if (recognitionRef.current) {
+        try { recognitionRef.current.onend = null; recognitionRef.current.stop(); } catch {}
       }
       if (mediaStreamRef.current) {
         try { mediaStreamRef.current.getTracks().forEach((t) => t.stop()); } catch {}
       }
       if (streamPlayerRef.current) streamPlayerRef.current.stop();
-      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (endOfTurnTimerRef.current) clearTimeout(endOfTurnTimerRef.current);
     };
   }, []);
 
-  // Main interactive voice query handler
+  // Main interactive voice query handler — called the moment a full
+  // utterance is detected (Web Speech's isFinal, or the VAD's onSpeechEnd),
+  // never from a client-guessed silence timer.
   const handleInteractiveVoiceInput = useCallback(async (transcriptText) => {
     if (!transcriptText || !transcriptText.trim()) return;
     const cleanText = transcriptText.trim();
-    
-    // Prevent duplicate processing of the same phrase or while AI is active
-    if (cleanText === lastProcessedSpeechRef.current || isProcessingRef.current) return;
-    
-    lastProcessedSpeechRef.current = cleanText;
+
+    const last = lastProcessedSpeechRef.current;
+    const now = Date.now();
+    // Dedupe only within a short window so a genuinely repeated utterance
+    // later in the call still goes through.
+    if (last.text === cleanText && now - last.at < 3000) return;
+    if (isProcessingRef.current) return;
+
+    lastProcessedSpeechRef.current = { text: cleanText, at: now };
     isProcessingRef.current = true;
     setLiveTranscript("");
     latestSpeechRef.current = "";
+    finalTranscriptRef.current = "";
+
+    const myTurn = ++activeTurnIdRef.current;
 
     const userMsg = {
       id: `user-${Date.now()}`,
@@ -156,9 +183,6 @@ export default function ChatPage() {
     setMessages((prev) => [...prev, userMsg]);
     setIsTyping(true);
     setCallStatusText("🩺 AI Doctor is thinking...");
-
-    // Segments recorded while isProcessingRef is true are discarded by the
-    // segment recorder's onstop handler, so no explicit pause is needed here.
 
     // 1. Try WebSocket streaming if backend is connected
     if (colabConnected && colabUrl) {
@@ -187,9 +211,9 @@ export default function ChatPage() {
           ws.onopen = sendPayload;
         }
 
-        let accumulatedResponse = "";
-
         ws.onmessage = (event) => {
+          // Drop messages belonging to a turn the user has since interrupted.
+          if (activeTurnIdRef.current !== myTurn) return;
           try {
             const payload = JSON.parse(event.data);
             if (payload.type === "audio_chunk" && payload.audio_base64) {
@@ -197,13 +221,12 @@ export default function ChatPage() {
                 streamPlayerRef.current.addChunk(payload.audio_base64);
               }
             } else if (payload.type === "response_complete") {
-              accumulatedResponse = payload.full_text;
               setMessages((prev) => [
                 ...prev,
                 {
                   id: `ai-${Date.now()}`,
                   role: "ai",
-                  content: accumulatedResponse,
+                  content: payload.full_text,
                   time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
                 },
               ]);
@@ -215,6 +238,7 @@ export default function ChatPage() {
         };
 
         ws.onerror = (err) => {
+          if (activeTurnIdRef.current !== myTurn) return;
           console.warn("Voice WS error, fallback to REST API:", err);
           fallbackRestCall(cleanText);
         };
@@ -228,6 +252,8 @@ export default function ChatPage() {
     // 2. Fallback REST API
     await fallbackRestCall(cleanText);
   }, [colabConnected, colabUrl, selectedVoice, messages]);
+
+  useEffect(() => { handleTurnRef.current = handleInteractiveVoiceInput; }, [handleInteractiveVoiceInput]);
 
   const fallbackRestCall = async (transcriptText) => {
     try {
@@ -258,41 +284,214 @@ export default function ChatPage() {
     }
   };
 
-  // ─── English: Web SpeechRecognition ────────
-  useEffect(() => {
-    if (typeof window === "undefined" || voiceLang !== "en-US") return;
+  // ─── Barge-in ───────────────────────────────────────────
+  // Called the instant the user starts speaking again, whether the AI is
+  // mid-sentence or still "thinking". Cuts AI audio immediately and bumps
+  // the turn-id so any late-arriving WS messages for the interrupted turn
+  // are ignored (see the activeTurnIdRef check in handleInteractiveVoiceInput).
+  const interruptAiTurn = useCallback(() => {
+    if (!isAvatarTalkingRef.current && !isProcessingRef.current) return;
+    activeTurnIdRef.current += 1;
+    if (streamPlayerRef.current) streamPlayerRef.current.stop(); // -> onPlayEnd flips isAvatarTalking false
+    if (voiceWsRef.current) {
+      try { voiceWsRef.current.close(); } catch {}
+      voiceWsRef.current = null;
+    }
+    isProcessingRef.current = false;
+    setIsTyping(false);
+    setCallStatusText("🎧 Listening...");
+  }, []);
 
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) return;
+  const webSpeechAvailable = () =>
+    typeof window !== "undefined" && !!(window.SpeechRecognition || window.webkitSpeechRecognition);
 
-    const recognition = new SpeechRecognition();
+  // ─── Whisper/VAD fallback tier ───────────────────────────
+  // Only used when the browser has no Web Speech API, or it fails/is
+  // unsupported for the requested language (see activateWhisperFallback).
+  // Real utterance-level VAD segmentation (lib/vadSegmenter.js) replaces
+  // the old fixed-interval slicing — the backend only ever sees genuine
+  // speech, and speech-start/speech-end give real barge-in and turn-end
+  // signals instead of a client-guessed silence timer.
+  const startVadListening = useCallback(async (stream) => {
+    const cleanBackendUrl = sanitizeBackendUrl(colabUrl);
+    const wsUrl = buildWsUrl(colabUrl, "/ws/transcribe");
+
+    if (whisperWsRef.current) {
+      try { whisperWsRef.current.close(); } catch {}
+    }
+
+    try {
+      const ws = new WebSocket(wsUrl);
+      whisperWsRef.current = ws;
+      ws.onopen = () => setCallStatusText("🎤 On-device Bengali recognition connected...");
+      ws.onerror = () => setCallStatusText("🎤 Listening (on-device Bengali recognition)...");
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "transcript" && msg.text) {
+            const text = msg.text.trim();
+            if (text) handleTurnRef.current?.(text);
+          }
+        } catch (e) {
+          console.warn("Whisper msg parse error:", e);
+        }
+      };
+    } catch (wsInitErr) {
+      console.warn("Whisper WebSocket init failed:", wsInitErr);
+    }
+
+    const { createVadSegmenter } = await import("@/lib/vadSegmenter");
+    const { encodeWavBase64 } = await import("@/lib/wavEncoder");
+
+    // Whisper's classic silence/noise hallucination artifacts — filtered
+    // client-side as a last line of defense on top of the backend's own
+    // no_speech_prob/avg_logprob filtering.
+    const HALLUCINATION_PATTERNS = [/^ধন্যবাদ\.?$/i, /^thank you\.?$/i, /^subtitle/i, /^উপস্থাপনা/i];
+
+    const applyTranscript = (text) => {
+      const clean = (text || "").trim();
+      if (!clean || clean.length < 2) return;
+      if (HALLUCINATION_PATTERNS.some((re) => re.test(clean))) return;
+      handleTurnRef.current?.(clean);
+    };
+
+    const sendUtterance = async (audioData, meta) => {
+      let base64;
+      let format;
+      if (meta.format === "pcm16k") {
+        if (audioData.length < 400 * 16) return; // shorter than ~400ms, ignore
+        base64 = encodeWavBase64(audioData, 16000);
+        format = "wav";
+      } else {
+        if (audioData.size < 800) return;
+        base64 = await new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(String(reader.result).split(",")[1]);
+          reader.readAsDataURL(audioData);
+        });
+        format = "webm";
+      }
+
+      if (whisperWsRef.current && whisperWsRef.current.readyState === WebSocket.OPEN) {
+        whisperWsRef.current.send(JSON.stringify({ audio: base64, lang: "bn", format }));
+        setCallStatusText("🧠 Transcribing...");
+        return;
+      }
+
+      try {
+        setCallStatusText("🧠 Transcribing via HTTP...");
+        const httpRes = await fetch(`${cleanBackendUrl}/api/transcribe`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ audio_base64: base64, lang: "bn", format }),
+        });
+        const data = await httpRes.json();
+        if (data.success) applyTranscript(data.transcript);
+      } catch (httpErr) {
+        console.warn("HTTP Transcribe fallback error:", httpErr);
+      }
+    };
+
+    const vad = await createVadSegmenter({
+      stream,
+      onSpeechStart: () => {
+        setLiveTranscript("");
+        interruptAiTurn();
+      },
+      onSpeechEnd: (audioData, meta) => sendUtterance(audioData, meta),
+      onError: (err) => console.warn("VAD error:", err),
+    });
+
+    vadRef.current = vad;
+    setIsListening(true);
+    setCallStatusText(
+      `🎤 Listening (on-device Bengali recognition${vad.engine === "energy" ? ", basic mode" : ""})...`
+    );
+  }, [colabUrl, interruptAiTurn]);
+
+  const activateWhisperFallback = useCallback(async () => {
+    if (sttEngineRef.current === "whisper") return;
+    sttEngineRef.current = "whisper";
+    setSttEngine("whisper");
+
+    if (recognitionRef.current) {
+      try { recognitionRef.current.onend = null; recognitionRef.current.stop(); } catch {}
+      recognitionRef.current = null;
+    }
+    setCallStatusText("🎤 Switching to on-device Bengali recognition...");
+
+    let stream = mediaStreamRef.current;
+    if (!stream) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+        mediaStreamRef.current = stream;
+      } catch (err) {
+        console.warn("Mic re-acquire for fallback recognition failed:", err);
+        setCallStatusText("Microphone unavailable.");
+        return;
+      }
+    }
+    await startVadListening(stream);
+  }, [startVadListening]);
+
+  // ─── Web Speech API tier (primary — both Bengali and English) ───────────
+  // Built imperatively (never inside a useEffect keyed on fast-changing
+  // state like `messages`) so a mid-call re-render can never silently
+  // orphan the recognizer instance that's actually running.
+  const createRecognizer = useCallback((lang) => {
+    if (typeof window === "undefined") return null;
+    const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognitionCtor) return null;
+
+    const recognition = new SpeechRecognitionCtor();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = "en-US";
+    recognition.lang = lang;
 
     recognition.onresult = (event) => {
       let interim = "";
-      let final = "";
+      let gotFinal = false;
       for (let i = event.resultIndex; i < event.results.length; ++i) {
         const chunk = event.results[i][0].transcript;
-        if (event.results[i].isFinal) final += chunk;
-        else interim += chunk;
-      }
-      const spoken = final || interim;
-      if (spoken) {
-        latestSpeechRef.current = spoken;
-        setLiveTranscript(spoken);
-        if (mode === "text") setInput(spoken);
-
-        if (mode !== "text" && isVoiceCallActive) {
-          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-          silenceTimerRef.current = setTimeout(() => {
-            if (latestSpeechRef.current.trim().length >= 2) {
-              handleInteractiveVoiceInput(latestSpeechRef.current.trim());
-            }
-          }, 1200);
+        if (event.results[i].isFinal) {
+          finalTranscriptRef.current += chunk;
+          gotFinal = true;
+        } else {
+          interim += chunk;
         }
       }
+
+      const displayText = (finalTranscriptRef.current + " " + interim).trim();
+      if (displayText) {
+        latestSpeechRef.current = displayText;
+        setLiveTranscript(displayText);
+        if (modeRef.current === "text") setInput(displayText);
+      }
+
+      if (modeRef.current !== "text" && isVoiceCallActiveRef.current) {
+        interruptAiTurn();
+
+        if (endOfTurnTimerRef.current) clearTimeout(endOfTurnTimerRef.current);
+        if (gotFinal) {
+          // Short debounce purely to coalesce multiple back-to-back finals
+          // the engine sometimes emits for one sentence. Armed ONLY here
+          // (never by interim results or by background noise), which is
+          // the fix for calls that used to never submit — the old scheme
+          // re-armed on *any* transcript event, including hallucinated or
+          // noise-triggered ones, so it could never actually elapse.
+          endOfTurnTimerRef.current = setTimeout(() => {
+            const text = finalTranscriptRef.current.trim();
+            finalTranscriptRef.current = "";
+            if (text.length >= 2) handleTurnRef.current?.(text);
+          }, 800);
+        }
+      }
+    };
+
+    recognition.onspeechstart = () => {
+      if (modeRef.current !== "text" && isVoiceCallActiveRef.current) interruptAiTurn();
     };
 
     recognition.onerror = (event) => {
@@ -301,229 +500,122 @@ export default function ChatPage() {
         alert("Microphone permission was denied.");
         setIsVoiceCallActive(false);
         setIsListening(false);
+        return;
       }
+      if (!isVoiceCallActiveRef.current) return; // one-shot text-mode dictation: no fallback plumbing
+
+      if (["language-not-supported", "service-not-allowed", "audio-capture"].includes(event.error)) {
+        activateWhisperFallback();
+        return;
+      }
+      if (event.error === "network") {
+        webSpeechRetryRef.current += 1;
+        if (webSpeechRetryRef.current > 2) activateWhisperFallback();
+      }
+    };
+
+    recognition.onstart = () => {
+      recognitionStartedRef.current = true;
+      webSpeechRetryRef.current = 0;
+      setIsListening(true);
     };
 
     recognition.onend = () => {
-      if (isVoiceCallActive && !isAvatarTalking && !isTyping && voiceLang === "en-US") {
-        try { recognition.start(); setIsListening(true); } catch {}
-      } else {
-        setIsListening(false);
+      setIsListening(false);
+      if (isVoiceCallActiveRef.current && sttEngineRef.current === "webspeech") {
+        try { recognition.start(); } catch {}
       }
     };
 
+    return recognition;
+  }, [interruptAiTurn, activateWhisperFallback]);
+
+  const startWebSpeechListening = useCallback((lang) => {
+    const recognition = createRecognizer(lang);
+    if (!recognition) {
+      activateWhisperFallback();
+      return;
+    }
     recognitionRef.current = recognition;
-  }, [voiceLang, mode, isVoiceCallActive, isAvatarTalking, isTyping, handleInteractiveVoiceInput]);
-
-  // ─── Bengali: Whisper STT via MediaRecorder ──────────────
-  // Records short, self-contained segments (start → stop → restart) instead of
-  // slicing one continuous stream. Each stopped segment is a fully finalized,
-  // independently-decodable WebM file, so the backend can always decode it —
-  // no more reconstructing partial streams from arbitrary chunk windows.
-  // Segments are only sent when the previous one has finished transcribing,
-  // which keeps the request rate paced to the backend instead of piling up
-  // and getting progressively more delayed the longer the call runs.
-  const startWhisperListening = useCallback(async (stream) => {
-    const SEGMENT_MS = 1800;
-    const cleanBackendUrl = sanitizeBackendUrl(colabUrl);
-    const wsUrl = buildWsUrl(colabUrl, "/ws/transcribe");
-
-    if (whisperWsRef.current) {
-      try { whisperWsRef.current.close(); } catch {}
-    }
-
-    const transcribePendingRef = { current: false };
-
-    const handleTranscript = (rawText) => {
-      const text = (rawText || "").trim();
-      if (!text) return;
-      latestSpeechRef.current = text;
-      setLiveTranscript(text);
-
-      if (mode === "text") {
-        setInput(text);
-      } else if (isVoiceCallActive && text.length >= 3 && !isProcessingRef.current) {
-        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-        silenceTimerRef.current = setTimeout(() => {
-          handleInteractiveVoiceInput(latestSpeechRef.current.trim());
-        }, 1200);
-      }
-    };
-
+    recognitionStartedRef.current = false;
     try {
-      const ws = new WebSocket(wsUrl);
-      whisperWsRef.current = ws;
-
-      ws.onopen = () => {
-        setCallStatusText("🎤 Whisper connected. Speak now in Bengali...");
-      };
-      ws.onerror = () => {
-        setCallStatusText("🎤 Whisper listening in Bengali...");
-      };
-
-      ws.onmessage = (event) => {
-        transcribePendingRef.current = false;
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === "transcript" && msg.text) {
-            handleTranscript(msg.text);
-          }
-        } catch (e) {
-          console.warn("Whisper msg parse error:", e);
-        }
-      };
-    } catch (wsInitErr) {
-      console.warn("WebSocket init failed:", wsInitErr);
+      recognition.start();
+    } catch (e) {
+      console.warn("Recognition start error:", e);
     }
-
-    let mimeType = "";
-    if (typeof MediaRecorder !== "undefined") {
-      if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mimeType = "audio/webm;codecs=opus";
-      else if (MediaRecorder.isTypeSupported("audio/webm")) mimeType = "audio/webm";
-      else if (MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")) mimeType = "audio/ogg;codecs=opus";
-      else if (MediaRecorder.isTypeSupported("audio/mp4")) mimeType = "audio/mp4";
-    }
-    const options = mimeType ? { mimeType } : undefined;
-
-    const sendSegment = async (blob) => {
-      const reader = new FileReader();
-      reader.onloadend = async () => {
-        const result = reader.result;
-        if (typeof result !== "string") {
-          transcribePendingRef.current = false;
-          return;
-        }
-        const base64 = result.split(",")[1];
-
-        // 1. Try WebSocket if connected
-        if (whisperWsRef.current && whisperWsRef.current.readyState === WebSocket.OPEN) {
-          whisperWsRef.current.send(JSON.stringify({ audio: base64, lang: "bn" }));
-          setCallStatusText("🧠 Whisper transcribing Bengali...");
-          return;
-        }
-
-        // 2. HTTP POST fallback
-        try {
-          setCallStatusText("🧠 Whisper transcribing via HTTP...");
-          const httpRes = await fetch(`${cleanBackendUrl}/api/transcribe`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ audio_base64: base64, lang: "bn" }),
-          });
-          const data = await httpRes.json();
-          if (data.success && data.transcript) {
-            handleTranscript(data.transcript);
-          }
-        } catch (httpErr) {
-          console.warn("HTTP Transcribe fallback error:", httpErr);
-        } finally {
-          transcribePendingRef.current = false;
-        }
-      };
-      reader.readAsDataURL(blob);
-    };
-
-    const recordSegment = () => {
-      if (!segmentActiveRef.current) return;
-
-      const recorder = new MediaRecorder(stream, options);
-      mediaRecorderRef.current = recorder;
-      const chunks = [];
-
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunks.push(e.data);
-      };
-
-      recorder.onstop = () => {
-        const shouldSend =
-          segmentActiveRef.current &&
-          !isProcessingRef.current && !isAvatarTalking && !transcribePendingRef.current;
-
-        if (shouldSend && chunks.length > 0) {
-          const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
-          if (blob.size > 800) {
-            transcribePendingRef.current = true;
-            // Safety valve: never block the pipeline forever on a lost response.
-            setTimeout(() => { transcribePendingRef.current = false; }, 6000);
-            sendSegment(blob);
-          }
-        }
-
-        // Immediately start the next segment so we don't miss speech.
-        recordSegment();
-      };
-
-      recorder.start();
-      setTimeout(() => {
-        if (recorder.state === "recording") {
-          try { recorder.stop(); } catch {}
-        }
-      }, SEGMENT_MS);
-    };
-
-    segmentActiveRef.current = true;
-    recordSegment();
-
-    setIsListening(true);
-    setCallStatusText("🎤 Whisper is listening in Bengali...");
-  }, [colabUrl, mode, isVoiceCallActive, isAvatarTalking, handleInteractiveVoiceInput]);
+    // If the engine never actually starts (some devices silently refuse an
+    // unsupported locale instead of erroring), fall back after a timeout.
+    setTimeout(() => {
+      if (!recognitionStartedRef.current && isVoiceCallActiveRef.current && sttEngineRef.current === "webspeech") {
+        activateWhisperFallback();
+      }
+    }, 3000);
+  }, [createRecognizer, activateWhisperFallback]);
 
   const startVoiceCall = async () => {
     if (streamPlayerRef.current) streamPlayerRef.current.init();
 
+    setIsVoiceCallActive(true);
+    isVoiceCallActiveRef.current = true;
+    setLiveTranscript("");
+    latestSpeechRef.current = "";
+    lastProcessedSpeechRef.current = { text: "", at: 0 };
+    isProcessingRef.current = false;
+    finalTranscriptRef.current = "";
+    webSpeechRetryRef.current = 0;
+
+    const lang = voiceLang;
+    const useWebSpeech = webSpeechAvailable();
+    sttEngineRef.current = useWebSpeech ? "webspeech" : "whisper";
+    setSttEngine(sttEngineRef.current);
+
+    if (useWebSpeech) {
+      setCallStatusText(lang === "bn-BD" ? "🎧 বাংলায় শুনছি... এখন বলুন" : "🎧 Listening in English... Speak now.");
+      startWebSpeechListening(lang);
+      return;
+    }
+
+    // No Web Speech API at all in this browser (e.g. Firefox/Safari) — go
+    // straight to the on-device Whisper/VAD tier.
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
     } catch (micErr) {
       alert("Microphone permission required for voice calls: " + micErr.message);
+      setIsVoiceCallActive(false);
+      isVoiceCallActiveRef.current = false;
       return;
     }
     mediaStreamRef.current = stream;
-
-    setIsVoiceCallActive(true);
-    setLiveTranscript("");
-    latestSpeechRef.current = "";
-    lastProcessedSpeechRef.current = "";
-    isProcessingRef.current = false;
-
-    const isBengali = voiceLang === "bn-BD";
-    isWhisperModeRef.current = isBengali;
-
-    if (isBengali) {
-      setCallStatusText("🎤 Connecting to Whisper backend...");
-      await startWhisperListening(stream);
-    } else {
-      setCallStatusText("🎧 Listening in English... Speak now.");
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.lang = "en-US";
-          recognitionRef.current.start();
-          setIsListening(true);
-        } catch (e) {
-          console.warn("English STT start error:", e);
-        }
-      }
-    }
+    setCallStatusText("🎤 Starting on-device Bengali recognition...");
+    await startVadListening(stream);
   };
 
   const stopVoiceCall = () => {
     setIsVoiceCallActive(false);
+    isVoiceCallActiveRef.current = false;
     setIsListening(false);
     isProcessingRef.current = false;
-    segmentActiveRef.current = false;
+    activeTurnIdRef.current += 1;
+    sttEngineRef.current = null;
+    setSttEngine(null);
     setCallStatusText("Call ended");
     setLiveTranscript("");
     latestSpeechRef.current = "";
-    lastProcessedSpeechRef.current = "";
+    lastProcessedSpeechRef.current = { text: "", at: 0 };
+    finalTranscriptRef.current = "";
 
-    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    if (endOfTurnTimerRef.current) clearTimeout(endOfTurnTimerRef.current);
 
     if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch {}
+      try { recognitionRef.current.onend = null; recognitionRef.current.stop(); } catch {}
+      recognitionRef.current = null;
     }
-
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      try { mediaRecorderRef.current.stop(); } catch {}
+    if (vadRef.current) {
+      try { vadRef.current.destroy(); } catch {}
+      vadRef.current = null;
     }
     if (mediaStreamRef.current) {
       try { mediaStreamRef.current.getTracks().forEach((t) => t.stop()); } catch {}
@@ -532,6 +624,10 @@ export default function ChatPage() {
     if (whisperWsRef.current) {
       try { whisperWsRef.current.close(); } catch {}
       whisperWsRef.current = null;
+    }
+    if (voiceWsRef.current) {
+      try { voiceWsRef.current.close(); } catch {}
+      voiceWsRef.current = null;
     }
 
     if (streamPlayerRef.current) streamPlayerRef.current.stop();
@@ -548,22 +644,29 @@ export default function ChatPage() {
       return;
     }
 
-    if (!recognitionRef.current) {
-      alert("Switch to English (ENG) for inline text dictation, or use Voice Call mode for Bengali.");
+    // Text-mode one-shot dictation (either language) — populates the input
+    // field only; manual Send press is still required (unchanged behavior).
+    if (isListening) {
+      if (recognitionRef.current) {
+        try { recognitionRef.current.onend = null; recognitionRef.current.stop(); } catch {}
+        recognitionRef.current = null;
+      }
+      setIsListening(false);
       return;
     }
 
-    if (isListening) {
-      recognitionRef.current.stop();
-      setIsListening(false);
-    } else {
-      try {
-        recognitionRef.current.lang = "en-US";
-        recognitionRef.current.start();
-        setIsListening(true);
-      } catch (err) {
-        console.warn("Recognition start err:", err);
-      }
+    const recognition = createRecognizer(voiceLang);
+    if (!recognition) {
+      alert("Voice dictation isn't supported in this browser. Please type your message instead.");
+      return;
+    }
+    recognition.continuous = false;
+    recognitionRef.current = recognition;
+    recognitionStartedRef.current = false;
+    try {
+      recognition.start();
+    } catch (err) {
+      console.warn("Recognition start err:", err);
     }
   };
 
@@ -811,6 +914,11 @@ export default function ChatPage() {
                     ○ Call Inactive
                   </span>
                 )}
+                {isVoiceCallActive && sttEngine && (
+                  <span className="badge" style={{ background: "rgba(106, 228, 255, 0.15)", color: "var(--color-spectral-cyan)", fontSize: 10 }}>
+                    {sttEngine === "webspeech" ? "☁️ Cloud Speech Recognition" : "🖥️ On-device Recognition"}
+                  </span>
+                )}
               </div>
 
               <h3 className="text-body-sm" style={{ fontWeight: 700, color: "var(--color-bone-white)", marginBottom: 4, fontSize: 17 }}>
@@ -851,6 +959,7 @@ export default function ChatPage() {
                 {isVoiceCallActive && (
                   <button
                     onClick={() => {
+                      if (endOfTurnTimerRef.current) clearTimeout(endOfTurnTimerRef.current);
                       if (latestSpeechRef.current.trim()) {
                         handleInteractiveVoiceInput(latestSpeechRef.current.trim());
                       }
