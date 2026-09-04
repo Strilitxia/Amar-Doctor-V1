@@ -24,16 +24,20 @@ _whisper_model = None
 _whisper_model_lock = asyncio.Lock()
 
 async def get_whisper_model():
-    """Lazy-load faster-whisper model (only downloaded once on first use)."""
+    """Lazy-load faster-whisper model with CUDA / CPU auto-detection and low-latency greedy inference."""
     global _whisper_model
     async with _whisper_model_lock:
         if _whisper_model is None:
             try:
                 from faster_whisper import WhisperModel
-                logger.info("Loading faster-whisper 'tiny' model for Bengali STT...")
-                # 'tiny' = ~39MB, ultra-fast CPU inference, instant download
-                _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-                logger.info("Whisper model loaded successfully.")
+                import torch
+                cuda_available = torch.cuda.is_available()
+                device = "cuda" if cuda_available else "cpu"
+                compute_type = "float16" if cuda_available else "int8"
+                logger.info(f"Loading faster-whisper 'tiny' model on {device} ({compute_type})...")
+                # 'tiny' = ~39MB, ultra-fast inference
+                _whisper_model = WhisperModel("tiny", device=device, compute_type=compute_type)
+                logger.info(f"Whisper model loaded successfully on {device}.")
             except ImportError:
                 logger.warning("faster-whisper not installed. Bengali STT will not be available.")
                 _whisper_model = None
@@ -93,6 +97,32 @@ class ChatConsultationRequest(BaseModel):
     mode: Optional[str] = "audio" # "audio" or "video"
     history: Optional[List[dict]] = []
     gemini_api_key: Optional[str] = None
+
+
+async def call_gemini(api_key: str, contents: list, system_suffix: str, max_output_tokens: int, timeout: float) -> str:
+    """
+    Call Gemini's generateContent REST API without blocking the asyncio event loop.
+    requests.post() is a blocking network call; running it directly inside an
+    `async def` freezes every other coroutine on this single-threaded server
+    (including the /ws/transcribe and /ws/voice-call sockets of an active call)
+    for the full duration of the request. Offloading it to a thread keeps the
+    event loop free so audio transcription keeps flowing while Gemini replies.
+    """
+    import requests
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}"
+    payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT + " " + system_suffix}]},
+        "contents": contents,
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": max_output_tokens}
+    }
+
+    def _post():
+        res = requests.post(url, json=payload, timeout=timeout)
+        return res.json()
+
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _post)
+    return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
 
 
 async def generate_edge_tts(text: str, voice: str = DEFAULT_BENGALI_VOICE, output_path: Optional[Path] = None) -> Path:
@@ -214,10 +244,6 @@ async def chat_consultation(req: ChatConsultationRequest):
 
         if api_key:
             try:
-                # Use Google Gemini API
-                import requests
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}"
-                
                 contents = []
                 for h in (req.history or []):
                     contents.append({
@@ -226,15 +252,11 @@ async def chat_consultation(req: ChatConsultationRequest):
                     })
                 contents.append({"role": "user", "parts": [{"text": req.message}]})
 
-                payload = {
-                    "system_instruction": {"parts": [{"text": SYSTEM_PROMPT + " Always respond using short, concise sentences. Do not use complex formatting."}]},
-                    "contents": contents,
-                    "generationConfig": {"temperature": 0.7, "maxOutputTokens": 300}
-                }
-                
-                res = requests.post(url, json=payload, timeout=10)
-                data = res.json()
-                reply_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                reply_text = await call_gemini(
+                    api_key, contents,
+                    system_suffix="Always respond using short, concise sentences. Do not use complex formatting.",
+                    max_output_tokens=300, timeout=10,
+                )
             except Exception as gemini_err:
                 logger.warning(f"Gemini API request failed, using intelligent fallback: {gemini_err}")
 
@@ -361,8 +383,6 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
 
             if api_key:
                 try:
-                    import requests
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}"
                     contents = []
                     for h in (history or []):
                         contents.append({
@@ -371,15 +391,11 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
                         })
                     contents.append({"role": "user", "parts": [{"text": user_msg}]})
 
-                    payload_data = {
-                        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT + " Always respond using short, concise sentences (under 12 words per sentence). Do not use bullet points or markdown."}]},
-                        "contents": contents,
-                        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 200}
-                    }
-
-                    res = requests.post(url, json=payload_data, timeout=8)
-                    data_json = res.json()
-                    full_reply = data_json.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    full_reply = await call_gemini(
+                        api_key, contents,
+                        system_suffix="Always respond using short, concise sentences (under 12 words per sentence). Do not use bullet points or markdown.",
+                        max_output_tokens=200, timeout=8,
+                    )
                 except Exception as e:
                     logger.warning(f"Gemini streaming error: {e}")
 
@@ -445,7 +461,7 @@ async def websocket_consultation_endpoint(websocket: WebSocket):
 async def whisper_transcribe_http(req: TranscribeRequest):
     """
     HTTP POST fallback endpoint for Whisper Bengali STT transcription.
-    Accepts Base64 audio, decodes and returns transcribed Bengali text.
+    Accepts Base64 audio, decodes in-memory and returns transcribed Bengali text with low-latency greedy decoding.
     Works 100% reliably over Cloudflare Tunnels, Ngrok, and Firewalls.
     """
     try:
@@ -457,9 +473,7 @@ async def whisper_transcribe_http(req: TranscribeRequest):
             b64_raw = b64_raw.split(",")[1]
 
         audio_bytes = base64.b64decode(b64_raw)
-        audio_path = TEMP_DIR / f"mic_{uuid.uuid4().hex[:8]}.webm"
-        with open(audio_path, "wb") as f:
-            f.write(audio_bytes)
+        audio_stream = io.BytesIO(audio_bytes)
 
         model = await get_whisper_model()
         if model is None:
@@ -467,22 +481,42 @@ async def whisper_transcribe_http(req: TranscribeRequest):
 
         loop = asyncio.get_event_loop()
         def transcribe():
-            segments, info = model.transcribe(
-                str(audio_path),
-                language=req.lang or "bn",
-                beam_size=5,
-                vad_filter=False,
-                condition_on_previous_text=False,
-            )
-            return " ".join(seg.text.strip() for seg in segments)
+            try:
+                audio_stream.seek(0)
+                segments, info = model.transcribe(
+                    audio_stream,
+                    language=req.lang or "bn",
+                    beam_size=1,
+                    best_of=1,
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=400),
+                    condition_on_previous_text=False,
+                )
+                return " ".join(seg.text.strip() for seg in segments)
+            except Exception as stream_err:
+                logger.warning(f"In-memory transcription fallback to temp file: {stream_err}")
+                temp_p = TEMP_DIR / f"mic_{uuid.uuid4().hex[:8]}.webm"
+                with open(temp_p, "wb") as f:
+                    f.write(audio_bytes)
+                try:
+                    segments, info = model.transcribe(
+                        str(temp_p),
+                        language=req.lang or "bn",
+                        beam_size=1,
+                        best_of=1,
+                        vad_filter=True,
+                        vad_parameters=dict(min_silence_duration_ms=400),
+                        condition_on_previous_text=False,
+                    )
+                    return " ".join(seg.text.strip() for seg in segments)
+                finally:
+                    try:
+                        temp_p.unlink()
+                    except:
+                        pass
 
         transcript = await loop.run_in_executor(None, transcribe)
         transcript = transcript.strip()
-
-        try:
-            audio_path.unlink()
-        except:
-            pass
 
         if transcript:
             logger.info(f"HTTP Whisper [{req.lang}] transcript: {transcript}")
@@ -496,7 +530,7 @@ async def whisper_transcribe_http(req: TranscribeRequest):
 async def whisper_transcribe_endpoint(websocket: WebSocket):
     """
     Real-time Bengali speech transcription via faster-whisper.
-    Browser sends raw audio bytes (webm/ogg/wav), backend returns Bengali text.
+    Browser sends raw audio bytes (webm/ogg/wav), backend returns Bengali text with low-latency greedy decoding.
     """
     await websocket.accept()
     logger.info("Whisper STT WebSocket connected.")
@@ -512,11 +546,9 @@ async def whisper_transcribe_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "error": "No audio data received"})
                 continue
 
-            # Decode base64 audio to temp file
+            # Decode base64 audio in-memory
             audio_data = base64.b64decode(audio_b64)
-            audio_path = TEMP_DIR / f"mic_{uuid.uuid4().hex[:8]}.webm"
-            with open(audio_path, "wb") as f:
-                f.write(audio_data)
+            audio_stream = io.BytesIO(audio_data)
 
             # Run Whisper transcription
             model = await get_whisper_model()
@@ -528,14 +560,39 @@ async def whisper_transcribe_endpoint(websocket: WebSocket):
                 # Run in thread pool to avoid blocking the event loop
                 loop = asyncio.get_event_loop()
                 def transcribe():
-                    segments, info = model.transcribe(
-                        str(audio_path),
-                        language=lang,
-                        beam_size=5,
-                        vad_filter=False,          # Decode full audio chunk without dropping short speech
-                        condition_on_previous_text=False,
-                    )
-                    return " ".join(seg.text.strip() for seg in segments)
+                    try:
+                        audio_stream.seek(0)
+                        segments, info = model.transcribe(
+                            audio_stream,
+                            language=lang,
+                            beam_size=1,
+                            best_of=1,
+                            vad_filter=True,
+                            vad_parameters=dict(min_silence_duration_ms=400),
+                            condition_on_previous_text=False,
+                        )
+                        return " ".join(seg.text.strip() for seg in segments)
+                    except Exception as stream_err:
+                        logger.warning(f"In-memory transcription fallback to temp file: {stream_err}")
+                        temp_p = TEMP_DIR / f"mic_{uuid.uuid4().hex[:8]}.webm"
+                        with open(temp_p, "wb") as f:
+                            f.write(audio_data)
+                        try:
+                            segments, info = model.transcribe(
+                                str(temp_p),
+                                language=lang,
+                                beam_size=1,
+                                best_of=1,
+                                vad_filter=True,
+                                vad_parameters=dict(min_silence_duration_ms=400),
+                                condition_on_previous_text=False,
+                            )
+                            return " ".join(seg.text.strip() for seg in segments)
+                        finally:
+                            try:
+                                temp_p.unlink()
+                            except:
+                                pass
 
                 transcript = await loop.run_in_executor(None, transcribe)
                 transcript = transcript.strip()
@@ -549,11 +606,6 @@ async def whisper_transcribe_endpoint(websocket: WebSocket):
             except Exception as transcribe_err:
                 logger.error(f"Whisper transcription error: {transcribe_err}")
                 await websocket.send_json({"type": "error", "error": str(transcribe_err)})
-            finally:
-                try:
-                    audio_path.unlink()
-                except:
-                    pass
 
     except WebSocketDisconnect:
         logger.info("Whisper STT client disconnected.")

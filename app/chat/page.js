@@ -56,9 +56,10 @@ export default function ChatPage() {
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
   const recognitionRef = useRef(null);   // English SpeechRecognition
-  const mediaRecorderRef = useRef(null); // Bengali Whisper MediaRecorder
+  const mediaRecorderRef = useRef(null); // Bengali Whisper MediaRecorder (current segment)
+  const mediaStreamRef = useRef(null);   // Live mic MediaStream, reused across segments
+  const segmentActiveRef = useRef(false); // Whether the record-segment loop should keep going
   const whisperWsRef = useRef(null);     // Bengali Whisper WebSocket
-  const audioChunksRef = useRef([]);     // Buffered audio chunks
   const audioPlayerRef = useRef(null);
   const streamPlayerRef = useRef(null);
   const voiceWsRef = useRef(null);
@@ -66,6 +67,7 @@ export default function ChatPage() {
   const latestSpeechRef = useRef("");
   const lastProcessedSpeechRef = useRef("");
   const isProcessingRef = useRef(false);
+  const isWhisperModeRef = useRef(false);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -99,23 +101,14 @@ export default function ChatPage() {
     streamPlayerRef.current.onPlayStart = () => {
       setIsAvatarTalking(true);
       setCallStatusText("🔊 AI Doctor is speaking...");
-
-      // Mute mic while AI doctor is speaking to prevent feedback loops
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-        try { mediaRecorderRef.current.pause(); } catch {}
-      }
+      // Segment recorder keeps running; segments recorded while talking are
+      // simply discarded (see onstop handler) to prevent feedback loops.
     };
 
     streamPlayerRef.current.onPlayEnd = () => {
       setIsAvatarTalking(false);
       isProcessingRef.current = false;
-      audioChunksRef.current = [];
       setCallStatusText("🎧 Listening to your voice... Speak now.");
-
-      // Resume mic after AI doctor finishes speaking
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "paused") {
-        try { mediaRecorderRef.current.resume(); } catch {}
-      }
     };
 
     if (typeof window !== "undefined") {
@@ -126,10 +119,14 @@ export default function ChatPage() {
     }
 
     return () => {
+      segmentActiveRef.current = false;
       if (voiceWsRef.current) voiceWsRef.current.close();
       if (whisperWsRef.current) whisperWsRef.current.close();
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
         try { mediaRecorderRef.current.stop(); } catch {}
+      }
+      if (mediaStreamRef.current) {
+        try { mediaStreamRef.current.getTracks().forEach((t) => t.stop()); } catch {}
       }
       if (streamPlayerRef.current) streamPlayerRef.current.stop();
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
@@ -146,7 +143,6 @@ export default function ChatPage() {
     
     lastProcessedSpeechRef.current = cleanText;
     isProcessingRef.current = true;
-    audioChunksRef.current = [];
     setLiveTranscript("");
     latestSpeechRef.current = "";
 
@@ -161,10 +157,8 @@ export default function ChatPage() {
     setIsTyping(true);
     setCallStatusText("🩺 AI Doctor is thinking...");
 
-    // Pause mic recording while preparing response
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-      try { mediaRecorderRef.current.pause(); } catch {}
-    }
+    // Segments recorded while isProcessingRef is true are discarded by the
+    // segment recorder's onstop handler, so no explicit pause is needed here.
 
     // 1. Try WebSocket streaming if backend is connected
     if (colabConnected && colabUrl) {
@@ -322,7 +316,15 @@ export default function ChatPage() {
   }, [voiceLang, mode, isVoiceCallActive, isAvatarTalking, isTyping, handleInteractiveVoiceInput]);
 
   // ─── Bengali: Whisper STT via MediaRecorder ──────────────
+  // Records short, self-contained segments (start → stop → restart) instead of
+  // slicing one continuous stream. Each stopped segment is a fully finalized,
+  // independently-decodable WebM file, so the backend can always decode it —
+  // no more reconstructing partial streams from arbitrary chunk windows.
+  // Segments are only sent when the previous one has finished transcribing,
+  // which keeps the request rate paced to the backend instead of piling up
+  // and getting progressively more delayed the longer the call runs.
   const startWhisperListening = useCallback(async (stream) => {
+    const SEGMENT_MS = 1800;
     const cleanBackendUrl = sanitizeBackendUrl(colabUrl);
     const wsUrl = buildWsUrl(colabUrl, "/ws/transcribe");
 
@@ -330,34 +332,41 @@ export default function ChatPage() {
       try { whisperWsRef.current.close(); } catch {}
     }
 
+    const transcribePendingRef = { current: false };
+
+    const handleTranscript = (rawText) => {
+      const text = (rawText || "").trim();
+      if (!text) return;
+      latestSpeechRef.current = text;
+      setLiveTranscript(text);
+
+      if (mode === "text") {
+        setInput(text);
+      } else if (isVoiceCallActive && text.length >= 3 && !isProcessingRef.current) {
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = setTimeout(() => {
+          handleInteractiveVoiceInput(latestSpeechRef.current.trim());
+        }, 1200);
+      }
+    };
+
     try {
       const ws = new WebSocket(wsUrl);
       whisperWsRef.current = ws;
-      audioChunksRef.current = [];
 
       ws.onopen = () => {
         setCallStatusText("🎤 Whisper connected. Speak now in Bengali...");
       };
-      ws.onerror = (e) => {
+      ws.onerror = () => {
         setCallStatusText("🎤 Whisper listening in Bengali...");
       };
 
       ws.onmessage = (event) => {
+        transcribePendingRef.current = false;
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === "transcript" && msg.text) {
-            const text = msg.text.trim();
-            latestSpeechRef.current = text;
-            setLiveTranscript(text);
-
-            if (mode === "text") {
-              setInput(text);
-            } else if (isVoiceCallActive && text.length >= 3 && !isProcessingRef.current) {
-              if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-              silenceTimerRef.current = setTimeout(() => {
-                handleInteractiveVoiceInput(latestSpeechRef.current.trim());
-              }, 1200);
-            }
+            handleTranscript(msg.text);
           }
         } catch (e) {
           console.warn("Whisper msg parse error:", e);
@@ -374,69 +383,87 @@ export default function ChatPage() {
       else if (MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")) mimeType = "audio/ogg;codecs=opus";
       else if (MediaRecorder.isTypeSupported("audio/mp4")) mimeType = "audio/mp4";
     }
-
     const options = mimeType ? { mimeType } : undefined;
-    const recorder = new MediaRecorder(stream, options);
-    mediaRecorderRef.current = recorder;
 
-    recorder.ondataavailable = (e) => {
-      // Don't process incoming audio if AI doctor is speaking or thinking
-      if (isProcessingRef.current || isAvatarTalking) return;
-
-      if (e.data && e.data.size > 100) {
-        audioChunksRef.current.push(e.data);
-        const fullBlob = new Blob(audioChunksRef.current, { type: mimeType || "audio/webm" });
-
-        const reader = new FileReader();
-        reader.onloadend = async () => {
-          const result = reader.result;
-          if (result && typeof result === "string") {
-            const base64 = result.split(",")[1];
-
-            // 1. Try WebSocket if connected
-            if (whisperWsRef.current && whisperWsRef.current.readyState === WebSocket.OPEN) {
-              whisperWsRef.current.send(JSON.stringify({ audio: base64, lang: "bn" }));
-              setCallStatusText("🧠 Whisper transcribing Bengali...");
-              return;
-            }
-
-            // 2. HTTP POST fallback
-            try {
-              setCallStatusText("🧠 Whisper transcribing via HTTP...");
-              const httpRes = await fetch(`${cleanBackendUrl}/api/transcribe`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ audio_base64: base64, lang: "bn" }),
-              });
-              const data = await httpRes.json();
-              if (data.success && data.transcript) {
-                const text = data.transcript.trim();
-                latestSpeechRef.current = text;
-                setLiveTranscript(text);
-
-                if (mode === "text") {
-                  setInput(text);
-                } else if (isVoiceCallActive && text.length >= 3 && !isProcessingRef.current) {
-                  if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-                  silenceTimerRef.current = setTimeout(() => {
-                    handleInteractiveVoiceInput(latestSpeechRef.current.trim());
-                  }, 1200);
-                }
-              }
-            } catch (httpErr) {
-              console.warn("HTTP Transcribe fallback error:", httpErr);
-            }
-          }
-        };
-        reader.readAsDataURL(fullBlob);
-
-        if (audioChunksRef.current.length > 8) {
-          audioChunksRef.current = [];
+    const sendSegment = async (blob) => {
+      const reader = new FileReader();
+      reader.onloadend = async () => {
+        const result = reader.result;
+        if (typeof result !== "string") {
+          transcribePendingRef.current = false;
+          return;
         }
-      }
+        const base64 = result.split(",")[1];
+
+        // 1. Try WebSocket if connected
+        if (whisperWsRef.current && whisperWsRef.current.readyState === WebSocket.OPEN) {
+          whisperWsRef.current.send(JSON.stringify({ audio: base64, lang: "bn" }));
+          setCallStatusText("🧠 Whisper transcribing Bengali...");
+          return;
+        }
+
+        // 2. HTTP POST fallback
+        try {
+          setCallStatusText("🧠 Whisper transcribing via HTTP...");
+          const httpRes = await fetch(`${cleanBackendUrl}/api/transcribe`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ audio_base64: base64, lang: "bn" }),
+          });
+          const data = await httpRes.json();
+          if (data.success && data.transcript) {
+            handleTranscript(data.transcript);
+          }
+        } catch (httpErr) {
+          console.warn("HTTP Transcribe fallback error:", httpErr);
+        } finally {
+          transcribePendingRef.current = false;
+        }
+      };
+      reader.readAsDataURL(blob);
     };
 
-    recorder.start(2000);
+    const recordSegment = () => {
+      if (!segmentActiveRef.current) return;
+
+      const recorder = new MediaRecorder(stream, options);
+      mediaRecorderRef.current = recorder;
+      const chunks = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+
+      recorder.onstop = () => {
+        const shouldSend =
+          segmentActiveRef.current &&
+          !isProcessingRef.current && !isAvatarTalking && !transcribePendingRef.current;
+
+        if (shouldSend && chunks.length > 0) {
+          const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
+          if (blob.size > 800) {
+            transcribePendingRef.current = true;
+            // Safety valve: never block the pipeline forever on a lost response.
+            setTimeout(() => { transcribePendingRef.current = false; }, 6000);
+            sendSegment(blob);
+          }
+        }
+
+        // Immediately start the next segment so we don't miss speech.
+        recordSegment();
+      };
+
+      recorder.start();
+      setTimeout(() => {
+        if (recorder.state === "recording") {
+          try { recorder.stop(); } catch {}
+        }
+      }, SEGMENT_MS);
+    };
+
+    segmentActiveRef.current = true;
+    recordSegment();
+
     setIsListening(true);
     setCallStatusText("🎤 Whisper is listening in Bengali...");
   }, [colabUrl, mode, isVoiceCallActive, isAvatarTalking, handleInteractiveVoiceInput]);
@@ -451,6 +478,7 @@ export default function ChatPage() {
       alert("Microphone permission required for voice calls: " + micErr.message);
       return;
     }
+    mediaStreamRef.current = stream;
 
     setIsVoiceCallActive(true);
     setLiveTranscript("");
@@ -482,6 +510,7 @@ export default function ChatPage() {
     setIsVoiceCallActive(false);
     setIsListening(false);
     isProcessingRef.current = false;
+    segmentActiveRef.current = false;
     setCallStatusText("Call ended");
     setLiveTranscript("");
     latestSpeechRef.current = "";
@@ -495,6 +524,10 @@ export default function ChatPage() {
 
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       try { mediaRecorderRef.current.stop(); } catch {}
+    }
+    if (mediaStreamRef.current) {
+      try { mediaStreamRef.current.getTracks().forEach((t) => t.stop()); } catch {}
+      mediaStreamRef.current = null;
     }
     if (whisperWsRef.current) {
       try { whisperWsRef.current.close(); } catch {}
