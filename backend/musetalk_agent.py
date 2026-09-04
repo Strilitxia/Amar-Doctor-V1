@@ -2,7 +2,7 @@
 Amar Doctor V1 — LiveKit Cloud MuseTalk Real-time Video Agent
 Runs inside Google Colab (Free T4 GPU) or local GPU server.
 Connects to LiveKit Cloud room, receives patient prompts via LiveKit Data Channels,
-streams Gemini responses -> Edge-TTS Bengali audio -> MuseTalk video frames over WebRTC.
+streams Groq (GPT-OSS-120B) responses -> Edge-TTS Bengali audio -> MuseTalk video frames over WebRTC.
 """
 
 import os

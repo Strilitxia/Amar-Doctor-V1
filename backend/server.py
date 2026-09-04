@@ -1,7 +1,7 @@
 """
 Amar Doctor V1 — AI Video & Audio Sandbox Backend
-FastAPI server for Edge-TTS Bengali voice synthesis, Gemini medical triage,
-and SadTalker/LivePortrait AI avatar video pipeline.
+FastAPI server for Edge-TTS Bengali voice synthesis, Groq (GPT-OSS-120B)
+medical triage, and SadTalker/LivePortrait AI avatar video pipeline.
 Designed for Google Colab (Free T4 GPU) & Local execution.
 """
 
@@ -19,14 +19,13 @@ from pathlib import Path
 
 import edge_tts
 
-# Lazy-loaded Whisper model — this is now only the FALLBACK STT tier (the
-# frontend's primary transcription path is the browser's own Web Speech API;
-# Whisper only runs for browsers that lack it, e.g. Firefox/Safari). Model
-# size/device/compute-type are env-configurable since "tiny" (the old
-# hardcoded default) is known to be weak specifically on Bengali. Defaults:
-# "small" on GPU (fast + noticeably more accurate), "base" on CPU-only (the
-# safe ceiling — "small" on CPU-only would run several times slower than
-# real time, unusable in a live call).
+# Lazy-loaded Whisper model — the ONLY speech-to-text engine used by this
+# app (no browser Web Speech API is used anywhere, so audio never leaves
+# this backend). Model size/device/compute-type are env-configurable since
+# "tiny" (the old hardcoded default) is known to be weak specifically on
+# Bengali. Defaults: "small" on GPU (fast + noticeably more accurate),
+# "base" on CPU-only (the safe ceiling — "small" on CPU-only would run
+# several times slower than real time, unusable in a live call).
 _whisper_model = None
 _whisper_model_lock = asyncio.Lock()
 
@@ -83,7 +82,7 @@ logger = logging.getLogger("amar-doctor-backend")
 
 app = FastAPI(
     title="Amar Doctor V1 AI Avatar & Neural Voice Pipeline",
-    description="FastAPI sandbox for Bengali Neural Voice Synthesis, Gemini Medical Triage, and Video Avatar Streaming",
+    description="FastAPI sandbox for Bengali Neural Voice Synthesis, Groq GPT-OSS-120B Medical Triage, and Video Avatar Streaming",
     version="1.0.0"
 )
 
@@ -111,7 +110,7 @@ DEFAULT_ENGLISH_VOICE = "en-US-JennyNeural"
 TEMP_DIR = Path(tempfile.gettempdir()) / "amar_doctor_media"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# System prompt for Gemini Medical Assistant
+# System prompt for the Groq (GPT-OSS-120B) Medical Assistant
 SYSTEM_PROMPT = """You are "Amar Doctor" (আমার ডাক্তার), a highly empathetic and knowledgeable AI medical consultant designed specifically for rural Bangladesh.
 - Triage symptoms and explain diagnoses in clear, reassuring Bengali (বাংলা) with English terms where appropriate.
 - Keep responses concise (2 to 4 sentences), direct, and easy to speak aloud via neural text-to-speech.
@@ -136,33 +135,40 @@ class ChatConsultationRequest(BaseModel):
     voice: Optional[str] = DEFAULT_BENGALI_VOICE
     mode: Optional[str] = "audio" # "audio" or "video"
     history: Optional[List[dict]] = []
-    gemini_api_key: Optional[str] = None
+    groq_api_key: Optional[str] = None
 
 
-async def call_gemini(api_key: str, contents: list, system_suffix: str, max_output_tokens: int, timeout: float) -> str:
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+
+async def call_groq(api_key: str, messages: list, max_output_tokens: int, timeout: float) -> str:
     """
-    Call Gemini's generateContent REST API without blocking the asyncio event loop.
-    requests.post() is a blocking network call; running it directly inside an
-    `async def` freezes every other coroutine on this single-threaded server
-    (including the /ws/transcribe and /ws/voice-call sockets of an active call)
-    for the full duration of the request. Offloading it to a thread keeps the
-    event loop free so audio transcription keeps flowing while Gemini replies.
+    Call Groq's OpenAI-compatible chat completions API (model: GPT-OSS-120B)
+    without blocking the asyncio event loop. requests.post() is a blocking
+    network call; running it directly inside an `async def` freezes every
+    other coroutine on this single-threaded server (including the
+    /ws/transcribe and /ws/voice-call sockets of an active call) for the
+    full duration of the request. Offloading it to a thread keeps the event
+    loop free so audio transcription keeps flowing while Groq replies.
     """
     import requests
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}"
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT + " " + system_suffix}]},
-        "contents": contents,
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": max_output_tokens}
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": max_output_tokens,
     }
 
     def _post():
-        res = requests.post(url, json=payload, timeout=timeout)
+        res = requests.post(url, json=payload, headers=headers, timeout=timeout)
         return res.json()
 
     loop = asyncio.get_event_loop()
     data = await loop.run_in_executor(None, _post)
-    return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+    choice = (data.get("choices") or [{}])[0]
+    return ((choice.get("message") or {}).get("content") or "").strip()
 
 
 async def generate_edge_tts(text: str, voice: str = DEFAULT_BENGALI_VOICE, output_path: Optional[Path] = None) -> Path:
@@ -275,31 +281,30 @@ async def text_to_speech(req: TTSRequest):
 async def chat_consultation(req: ChatConsultationRequest):
     """
     End-to-end AI consultation:
-    1. Generates clinical response via Gemini or fallback
+    1. Generates clinical response via Groq (GPT-OSS-120B) or fallback
     2. Converts response to Bengali neural audio with Edge-TTS
     3. Returns text + audio payload
     """
     try:
-        api_key = req.gemini_api_key or os.environ.get("GEMINI_API_KEY")
+        api_key = req.groq_api_key or os.environ.get("GROQ_API_KEY")
         reply_text = ""
 
         if api_key:
             try:
-                contents = []
+                messages = [{
+                    "role": "system",
+                    "content": SYSTEM_PROMPT + " Always respond using short, concise sentences. Do not use complex formatting.",
+                }]
                 for h in (req.history or []):
-                    contents.append({
-                        "role": "model" if h.get("role") == "ai" else "user",
-                        "parts": [{"text": h.get("content", "")}]
+                    messages.append({
+                        "role": "assistant" if h.get("role") == "ai" else "user",
+                        "content": h.get("content", ""),
                     })
-                contents.append({"role": "user", "parts": [{"text": req.message}]})
+                messages.append({"role": "user", "content": req.message})
 
-                reply_text = await call_gemini(
-                    api_key, contents,
-                    system_suffix="Always respond using short, concise sentences. Do not use complex formatting.",
-                    max_output_tokens=300, timeout=10,
-                )
-            except Exception as gemini_err:
-                logger.warning(f"Gemini API request failed, using intelligent fallback: {gemini_err}")
+                reply_text = await call_groq(api_key, messages, max_output_tokens=300, timeout=10)
+            except Exception as groq_err:
+                logger.warning(f"Groq API request failed, using intelligent fallback: {groq_err}")
 
         if not reply_text:
             # Intelligent rural medical fallback responses
@@ -382,7 +387,7 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
     """
     Pipelined Interactive Voice Call Endpoint:
     1. Receives user query text over WebSocket.
-    2. Streams response from Gemini token by token.
+    2. Streams response from Groq (GPT-OSS-120B).
     3. Triggers Edge-TTS phrase synthesis immediately on punctuation marks (. , ? ! ; ।).
     4. Sends phrase text + low-latency audio base64 chunk back over WebSocket instantly.
     """
@@ -395,7 +400,7 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
             user_msg = payload.get("message", "")
             voice = payload.get("voice", DEFAULT_BENGALI_VOICE)
             history = payload.get("history", [])
-            api_key = payload.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY")
+            api_key = payload.get("groq_api_key") or os.environ.get("GROQ_API_KEY")
 
             await websocket.send_json({"type": "status", "status": "listening", "msg": "Processing prompt..."})
 
@@ -424,21 +429,20 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
 
             if api_key:
                 try:
-                    contents = []
+                    messages = [{
+                        "role": "system",
+                        "content": SYSTEM_PROMPT + " Always respond using short, concise sentences (under 12 words per sentence). Do not use bullet points or markdown.",
+                    }]
                     for h in (history or []):
-                        contents.append({
-                            "role": "model" if h.get("role") == "ai" else "user",
-                            "parts": [{"text": h.get("content", "")}]
+                        messages.append({
+                            "role": "assistant" if h.get("role") == "ai" else "user",
+                            "content": h.get("content", ""),
                         })
-                    contents.append({"role": "user", "parts": [{"text": user_msg}]})
+                    messages.append({"role": "user", "content": user_msg})
 
-                    full_reply = await call_gemini(
-                        api_key, contents,
-                        system_suffix="Always respond using short, concise sentences (under 12 words per sentence). Do not use bullet points or markdown.",
-                        max_output_tokens=200, timeout=8,
-                    )
+                    full_reply = await call_groq(api_key, messages, max_output_tokens=200, timeout=8)
                 except Exception as e:
-                    logger.warning(f"Gemini streaming error: {e}")
+                    logger.warning(f"Groq streaming error: {e}")
 
             if not full_reply:
                 full_reply = "আমি আপনার লক্ষণ বুঝতে পেরেছি। পর্যাপ্ত বিশ্রাম নিন ও খাবার স্যালাইন পান করুন। অবস্থা বেগতিক হলে দ্রুত হাসপাতালে যোগাযোগ করুন।"

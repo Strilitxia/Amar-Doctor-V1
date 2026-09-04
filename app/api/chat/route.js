@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+const GROQ_MODEL = "openai/gpt-oss-120b";
+
 // Mock responses for when no API key is configured
 const MOCK_RESPONSES = [
   "Based on your symptoms, this could be a common viral infection. I recommend:\n\n১। পর্যাপ্ত বিশ্রাম নিন (Rest well)\n২। প্রচুর পানি পান করুন (Stay hydrated)\n৩। যদি জ্বর ১০২°F এর বেশি হয়, প্যারাসিটামল নিন (Take paracetamol if fever exceeds 102°F)\n\n⚠️ If symptoms persist for more than 3 days, please visit a nearby hospital. Use our Map feature to find one.",
@@ -11,7 +13,7 @@ export async function POST(request) {
   try {
     const { message, history } = await request.json();
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.GROQ_API_KEY;
 
     if (!apiKey) {
       // Return a mock response
@@ -22,8 +24,8 @@ export async function POST(request) {
       return NextResponse.json({ reply: MOCK_RESPONSES[randomIndex] });
     }
 
-    // Real Gemini API call
-    const systemPrompt = `You are "Amar Doctor" (আমার ডাক্তার), a compassionate and knowledgeable AI medical assistant designed for rural Bangladesh. 
+    // Real Groq (GPT-OSS-120B) API call
+    const systemPrompt = `You are "Amar Doctor" (আমার ডাক্তার), a compassionate and knowledgeable AI medical assistant designed for rural Bangladesh.
 
 Your responsibilities:
 - Provide preliminary medical guidance based on symptoms described by the patient
@@ -41,60 +43,42 @@ Important guidelines:
 - Suggest affordable, commonly available medications when appropriate
 - Always end with a recommendation to consult a real doctor if symptoms persist`;
 
-    const contents = [];
+    const chatMessages = [{ role: "system", content: systemPrompt }];
 
     // Add conversation history
     if (history && history.length > 0) {
       for (const msg of history) {
-        contents.push({
-          role: msg.role === "ai" ? "model" : "user",
-          parts: [{ text: msg.content }],
+        chatMessages.push({
+          role: msg.role === "ai" ? "assistant" : "user",
+          content: msg.content,
         });
       }
     }
 
     // Add current message
-    contents.push({
-      role: "user",
-      parts: [{ text: message }],
-    });
+    chatMessages.push({ role: "user", content: message });
 
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          system_instruction: { parts: [{ text: systemPrompt }] },
-          contents,
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 4096,
-          },
-        }),
-      }
-    );
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: chatMessages,
+        temperature: 0.7,
+        max_tokens: 4096,
+      }),
+    });
 
     const data = await response.json();
 
     if (data.error) {
-      console.error("Gemini API Error details:", data.error);
+      console.error("Groq API Error details:", data.error);
     }
 
-    const candidate = data.candidates?.[0];
-    let reply = "";
-
-    if (candidate?.content?.parts) {
-      // Filter parts with text (Gemini 3.6 Flash returns text parts, with the main answer in the text part)
-      const textParts = candidate.content.parts
-        .filter((p) => p.text && !p.thought)
-        .map((p) => p.text.trim())
-        .filter(Boolean);
-
-      reply = textParts.length > 0
-        ? textParts[textParts.length - 1]
-        : candidate.content.parts[0]?.text || "";
-    }
+    let reply = data.choices?.[0]?.message?.content?.trim() || "";
 
     if (!reply) {
       reply = "I'm sorry, I couldn't process your request. Please try again.";

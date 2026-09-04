@@ -1,7 +1,7 @@
 # 🩺 Amar Doctor V1 (আমার ডাক্তার)
 > **Resilient AI Telemedicine & Emergency Healthcare Platform for Rural Bangladesh**
 
-Amar Doctor V1 is a full-stack, offline-first digital healthcare system designed specifically for the unique infrastructure and language challenges of rural Bangladesh. It combines **conversational AI triage (Gemini)**, **natural Bengali neural voice synthesis (Microsoft Edge-TTS)**, **GPU-accelerated lip-synced video avatars (MuseTalk / SadTalker)**, **on-device Bengali speech recognition (faster-whisper)**, **computer-vision prescription analysis**, and **zero-bandwidth offline medical decision trees (IndexedDB + PWA)**.
+Amar Doctor V1 is a full-stack, offline-first digital healthcare system designed specifically for the unique infrastructure and language challenges of rural Bangladesh. It combines **conversational AI triage (Groq GPT-OSS-120B)**, **natural Bengali neural voice synthesis (Microsoft Edge-TTS)**, **GPU-accelerated lip-synced video avatars (MuseTalk / SadTalker)**, **self-hosted Bengali speech recognition (faster-whisper — no browser/cloud Web Speech API is used)**, **computer-vision prescription analysis (Gemini Vision)**, and **zero-bandwidth offline medical decision trees (IndexedDB + PWA)**.
 
 ---
 
@@ -61,7 +61,7 @@ graph TD
     subgraph BackendAPI ["Next.js Serverless API"]
         M1 -.->|Fallback REST| API_Chat[/api/chat/]
         M2 -->|Multipart Image| API_Rx[/api/prescription/]
-        API_Chat --> GEMINI_CLOUD[Google Gemini 3.6 Flash]
+        API_Chat --> GROQ_CLOUD[Groq GPT-OSS-120B]
         API_Rx --> GEMINI_VISION[Google Gemini 3.6 Vision]
     end
 
@@ -72,11 +72,11 @@ graph TD
         M1 -.->|HTTP POST /api/chat-consultation| REST_Colab[Full Consultation Endpoint]
         M1 -.->|LiveKit WebRTC| LK[LiveKit Cloud Video Room]
 
-        WS_STT --> WHISPER_MODEL["faster-whisper 'tiny' (int8)"]
+        WS_STT --> WHISPER_MODEL["faster-whisper (small/base, GPU-aware)"]
         HTTP_STT --> WHISPER_MODEL
         
-        WS_Voice --> GEMINI_CORE[Gemini Clinical Triage]
-        GEMINI_CORE --> CHUNKER[Punctuation Delimiter Chunking]
+        WS_Voice --> GROQ_CORE[Groq GPT-OSS-120B Clinical Triage]
+        GROQ_CORE --> CHUNKER[Punctuation Delimiter Chunking]
         CHUNKER --> EDGE_TTS[Microsoft Edge-TTS Streaming]
         EDGE_TTS --> MT[MuseTalk / SadTalker Lip-Sync Video]
     end
@@ -102,8 +102,8 @@ graph TD
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                        FASTAPI BACKEND AI ENGINE (server.py)                           │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
-│ 1. STT Engine          : faster-whisper (tiny int8 model, Bengali language mode)       │
-│ 2. Clinical Reasoning  : Gemini 3.6 Flash with rural health system prompt               │
+│ 1. STT Engine          : faster-whisper (self-hosted only; no browser Web Speech API)  │
+│ 2. Clinical Reasoning  : Groq GPT-OSS-120B with rural health system prompt              │
 │ 3. TTS Synthesis       : Microsoft Edge-TTS (bn-BD-NabanitaNeural / PradeepNeural)     │
 │ 4. Streaming Chunking  : Punctuation triggers (। , . ? !) for instantaneous response   │
 │ 5. Avatar Synthesis    : MuseTalk / SadTalker neural lip synchronizer                  │
@@ -115,16 +115,15 @@ graph TD
 ## 🚀 Feature Breakdown
 
 ### 1. AI Doctor Voice & Video Consultation (`/chat`)
-- **Speech-to-Text (Bengali & English)**:
-  - **Bengali (`bn-BD`)**: Microphone stream recorded in WebM/Opus slices (every 2s) and streamed over WebSocket `/ws/transcribe` to a local or Colab `faster-whisper` model. Includes automatic HTTP POST `/api/transcribe` fallback if WebSockets are blocked by proxies.
-  - **English (`en-US`)**: Client-side hardware-accelerated `webkitSpeechRecognition` with instantaneous zero-network transcription.
-  - **Voice Activity & Silence Detection**: Automatically detects a 1.2-second pause in patient speech to trigger medical inference without needing to tap buttons.
+- **Speech-to-Text (Bengali & English) — self-hosted only, no browser Web Speech API**:
+  - A real Voice-Activity-Detection model (Silero VAD via `@ricky0123/vad-web`, running on-device in WASM) segments the microphone stream into genuine utterances — no fixed-length slicing, and no audio sent anywhere until real speech is detected.
+  - Each utterance is sent as a clean WAV over WebSocket `/ws/transcribe` to a local or Colab `faster-whisper` model (HTTP POST `/api/transcribe` as automatic fallback if WebSockets are blocked by proxies).
+  - **Turn detection**: driven by the VAD's own speech-end signal, not a client-guessed timer — a turn submits the moment the patient actually stops talking.
+  - **Barge-in**: speech detected while the AI is still talking immediately cuts its audio and starts capturing the interruption, like a real phone call.
 - **Pipelined Streaming Voice Synthesis (Edge-TTS)**:
   - LLM tokens are buffered until punctuation delimiters (`।`, `.`, `?`, `!`, `,`, `;`) appear.
   - Sub-sentences are immediately converted into natural Bengali audio waveforms using **Microsoft Edge-TTS** (`bn-BD-NabanitaNeural` / `bn-BD-PradeepNeural`).
   - Chunks are piped directly over the WebSocket to [AudioStreamPlayer.js](file:///Users/asif/project%20files/Amar%20Doctor%20V1/lib/audioStreamPlayer.js), playing back gaplessly while the rest of the response is still generating.
-- **Acoustic Echo Cancellation**:
-  - The client mic pauses whenever the AI doctor is vocalizing and resumes automatically upon audio end, eliminating feedback screeching in speakerphone environments.
 - **Dual-Mode Video Avatar (`VideoAvatar.js`)**:
   - **GPU Mode**: Deep-learning driven **MuseTalk** / **SadTalker** that generates lip-synced video frames matching the Bengali audio phonemes.
   - **Offline/Lightweight Canvas Mode**: A 60 FPS HTML5 procedural doctor avatar complete with sinusoidal breathing, periodic eye-blinking, audio-reactive mouth movement, and neon spectral visualizer waves.
@@ -188,8 +187,9 @@ graph TD
 |---|---|---|
 | **Frontend Framework** | **Next.js 16 (App Router) + React 19** | Modern server/client architecture |
 | **Styling & Design System** | **Tailwind CSS + Custom Modern Tokens** | High-contrast dark medical aesthetics |
-| **STT (Speech-to-Text)** | **faster-whisper (OpenAI Whisper on int8)** | Ultra-fast local/Colab Bengali transcription |
-| **LLM Clinical Core** | **Google Gemini 3.6 Flash (v1beta API)** | Multimodal reasoning & symptom triage |
+| **STT (Speech-to-Text)** | **faster-whisper (self-hosted, GPU-aware)** | On-device Bengali/English transcription — no browser Web Speech API |
+| **LLM Clinical Core** | **Groq — GPT-OSS-120B** | Fast open-weight reasoning & symptom triage |
+| **Vision (Prescription OCR)** | **Google Gemini 3.6 Vision** | Multimodal prescription image analysis |
 | **TTS (Text-to-Speech)** | **Microsoft Edge-TTS (v7 streaming)** | Natural neural Bengali voice at 0 cost |
 | **Avatar Lip-Sync** | **MuseTalk / SadTalker** | Neural video frame generation on GPU |
 | **Offline Storage** | **IndexedDB + PWA Service Worker** | 100% offline emergency first aid |
@@ -204,7 +204,7 @@ graph TD
 Amar Doctor V1/
 ├── app/
 │   ├── api/
-│   │   ├── chat/route.js            # Next.js Serverless Gemini Chat handler
+│   │   ├── chat/route.js            # Next.js Serverless Groq (GPT-OSS-120B) Chat handler
 │   │   └── prescription/route.js    # Gemini Vision prescription OCR handler
 │   ├── chat/page.js                 # Live Voice, Video & Text Consultation stage
 │   ├── emergency/page.js            # Real-time SOS Dispatcher Dashboard
@@ -256,8 +256,10 @@ Amar Doctor V1/
 3. **Configure Environment Variables**:
    Create a `.env.local` file in the root directory:
    ```env
+   GROQ_API_KEY=your_groq_api_key_here
    GEMINI_API_KEY=your_google_gemini_api_key_here
    ```
+   `GROQ_API_KEY` powers clinical chat triage (GPT-OSS-120B); `GEMINI_API_KEY` is only used for prescription image OCR (Gemini Vision — GPT-OSS-120B is text-only).
 
 4. **Run development server**:
    ```bash
@@ -299,7 +301,8 @@ API documentation will be accessible at [http://localhost:8000/docs](http://loca
 
 | Variable | Scope | Description |
 |---|---|---|
-| `GEMINI_API_KEY` | Next.js (`.env.local`) & Colab | Google Gemini API key for clinical chat triage and prescription image analysis. |
+| `GROQ_API_KEY` | Next.js (`.env.local`) & Colab | Groq API key for clinical chat triage (GPT-OSS-120B). |
+| `GEMINI_API_KEY` | Next.js (`.env.local`) | Google Gemini API key for prescription image analysis (Vision OCR only — GPT-OSS-120B has no vision support). |
 | `LIVEKIT_URL` | Colab / Backend (Optional) | LiveKit WebRTC server URL for cloud video streaming. |
 | `LIVEKIT_API_KEY` | Colab / Backend (Optional) | LiveKit cloud API authentication key. |
 | `LIVEKIT_API_SECRET` | Colab / Backend (Optional) | LiveKit cloud API secret. |
