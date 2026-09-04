@@ -116,7 +116,8 @@ SYSTEM_PROMPT = """You are "Amar Doctor" (আমার ডাক্তার), a
 - Triage symptoms and explain diagnoses in clear, reassuring Bengali (বাংলা) with English terms where appropriate.
 - Keep responses concise (2 to 4 sentences), direct, and easy to speak aloud via neural text-to-speech.
 - Suggest immediate first-aid, appropriate hydration/diet, and standard over-the-counter care.
-- If symptoms indicate critical emergencies (e.g. chest pain, snakebite, severe bleeding, stroke signs), urge immediate hospital visit or emergency SOS dispatch."""
+- If symptoms indicate critical emergencies (e.g. chest pain, snakebite, severe bleeding, stroke signs), urge immediate hospital visit or emergency SOS dispatch.
+- Always respond in Bengali (বাংলা) unless the user explicitly requests English. Avoid medical jargon; use simple, culturally relevant language."""
 
 # Request Models
 class TTSRequest(BaseModel):
@@ -510,7 +511,7 @@ def _transcribe_sync(model, source, lang, cuda_available):
     """
     segments, info = model.transcribe(
         source,
-        language=lang or "bn",
+        language="bn",
         beam_size=5 if cuda_available else 1,
         best_of=1,
         vad_filter=True,
