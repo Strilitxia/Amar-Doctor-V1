@@ -466,7 +466,7 @@ export default function ChatPage() {
     const recognition = new SpeechRecognitionCtor();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = lang;
+    recognition.lang = "bn-BD"; // always Bengali for Amar Doctor, even if the user has selected English
 
     recognition.onresult = (event) => {
       let interim = "";
