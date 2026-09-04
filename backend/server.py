@@ -519,10 +519,16 @@ def _transcribe_sync(model, source, lang, cuda_available):
         no_speech_threshold=0.6,
         log_prob_threshold=-1.0,
     )
+    # Drop a segment only when BOTH signals agree it's non-speech (this
+    # matches upstream Whisper's own silence heuristic). Using OR here
+    # instead — dropping if *either* signal looks even slightly off — was a
+    # bug: no_speech_prob runs a bit high on plenty of real, quieter Bengali
+    # speech, so that version silently discarded good transcripts, which is
+    # what made calls look permanently "stuck transcribing".
     kept = [
         seg.text.strip()
         for seg in segments
-        if seg.no_speech_prob <= 0.6 and seg.avg_logprob >= -1.0
+        if not (seg.no_speech_prob > 0.6 and seg.avg_logprob < -1.0)
     ]
     return " ".join(kept).strip()
 

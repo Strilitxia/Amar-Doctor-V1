@@ -315,25 +315,49 @@ export default function ChatPage() {
   const startVadListening = useCallback(async (stream) => {
     const cleanBackendUrl = sanitizeBackendUrl(colabUrl);
     const wsUrl = buildWsUrl(colabUrl, "/ws/transcribe");
+    const LISTENING_STATUS = "🎤 Listening (on-device Bengali recognition)...";
 
     if (whisperWsRef.current) {
       try { whisperWsRef.current.close(); } catch {}
     }
 
+    // Whisper's classic silence/noise hallucination artifacts — filtered
+    // client-side as a last line of defense on top of the backend's own
+    // no_speech_prob/avg_logprob filtering. Shared by both the WS and HTTP
+    // transcription paths below.
+    const HALLUCINATION_PATTERNS = [/^ধন্যবাদ\.?$/i, /^thank you\.?$/i, /^subtitle/i, /^উপস্থাপনা/i];
+
+    const applyTranscript = (text) => {
+      const clean = (text || "").trim();
+      // Whatever the outcome, this utterance's request is no longer in
+      // flight — reset the status text so the UI never looks stuck on
+      // "Transcribing..." forever (e.g. when the backend correctly returns
+      // an empty transcript for silence/noise).
+      setCallStatusText(LISTENING_STATUS);
+      if (!clean || clean.length < 2) return;
+      if (HALLUCINATION_PATTERNS.some((re) => re.test(clean))) return;
+      handleTurnRef.current?.(clean);
+    };
+
     try {
       const ws = new WebSocket(wsUrl);
       whisperWsRef.current = ws;
       ws.onopen = () => setCallStatusText("🎤 On-device Bengali recognition connected...");
-      ws.onerror = () => setCallStatusText("🎤 Listening (on-device Bengali recognition)...");
+      ws.onerror = () => setCallStatusText(LISTENING_STATUS);
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
-          if (msg.type === "transcript" && msg.text) {
-            const text = msg.text.trim();
-            if (text) handleTurnRef.current?.(text);
+          if (msg.type === "transcript") {
+            applyTranscript(msg.text);
+          } else if (msg.type === "empty") {
+            setCallStatusText(LISTENING_STATUS);
+          } else if (msg.type === "error") {
+            console.warn("Whisper WS error message:", msg.error);
+            setCallStatusText(LISTENING_STATUS);
           }
         } catch (e) {
           console.warn("Whisper msg parse error:", e);
+          setCallStatusText(LISTENING_STATUS);
         }
       };
     } catch (wsInitErr) {
@@ -342,18 +366,6 @@ export default function ChatPage() {
 
     const { createVadSegmenter } = await import("@/lib/vadSegmenter");
     const { encodeWavBase64 } = await import("@/lib/wavEncoder");
-
-    // Whisper's classic silence/noise hallucination artifacts — filtered
-    // client-side as a last line of defense on top of the backend's own
-    // no_speech_prob/avg_logprob filtering.
-    const HALLUCINATION_PATTERNS = [/^ধন্যবাদ\.?$/i, /^thank you\.?$/i, /^subtitle/i, /^উপস্থাপনা/i];
-
-    const applyTranscript = (text) => {
-      const clean = (text || "").trim();
-      if (!clean || clean.length < 2) return;
-      if (HALLUCINATION_PATTERNS.some((re) => re.test(clean))) return;
-      handleTurnRef.current?.(clean);
-    };
 
     const sendUtterance = async (audioData, meta) => {
       let base64;
@@ -386,9 +398,15 @@ export default function ChatPage() {
           body: JSON.stringify({ audio_base64: base64, lang: "bn", format }),
         });
         const data = await httpRes.json();
-        if (data.success) applyTranscript(data.transcript);
+        if (data.success) {
+          applyTranscript(data.transcript);
+        } else {
+          console.warn("HTTP transcribe failed:", data.error);
+          setCallStatusText(LISTENING_STATUS);
+        }
       } catch (httpErr) {
         console.warn("HTTP Transcribe fallback error:", httpErr);
+        setCallStatusText(LISTENING_STATUS);
       }
     };
 
