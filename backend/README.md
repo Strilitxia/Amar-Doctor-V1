@@ -44,19 +44,34 @@ All speech-to-text — both the live voice call and text-mode mic dictation
 browser's native Web Speech API is intentionally never used, so voice audio
 never leaves this backend to a third-party cloud recognizer.
 
-Model size defaults to accuracy over raw speed, auto-selected by GPU
-availability:
+Model size defaults to accuracy over raw speed, and is deliberately **not**
+scaled down on CPU. Model size is the dominant factor for Bengali quality:
+Whisper saw orders of magnitude less Bengali than English, so the small
+checkpoints collapse on Bengali long before they do on English. Measured on
+a 5s Bengali clip:
+
+| Model | Bengali output |
+|---|---|
+| `small` | `आमार तीम दीं दोरे जोर...` — drifts into Devanagari |
+| `large-v3` | `আমার তিম দিন ধরে জোর আর মাথাব্যথা হোছে, সাথে কাশি ও দুর্বলতা আছে।` |
+
+English is fine on either, which is why a too-small model reads as "Bengali
+is broken" rather than "the model is too small".
 
 | Env var | Default | Notes |
 |---|---|---|
-| `WHISPER_MODEL_SIZE` | `small` on GPU, `base` on CPU | `tiny` is noticeably weak on Bengali — avoid it unless you need the absolute smallest download. `small`/`medium` on CPU-only will run several times slower than real-time; a warning is logged if you set that combination. |
-| `WHISPER_DEVICE` | `cuda` if available, else `cpu` | |
+| `WHISPER_MODEL_SIZE` | `large-v3` (cpu and cuda alike) | `tiny`/`base` are unusable for Bengali (~100% WER) — a warning is logged if you select one. `medium`/`large-*` on CPU-only run slower than real-time; that warning is informational, not a suggestion to drop below `small`. |
+| `WHISPER_DEVICE` | `cuda` if available, else `cpu` | Falls back to CPU int8 automatically if the CUDA model fails to load. |
 | `WHISPER_COMPUTE_TYPE` | `float16` on GPU, `int8` on CPU | |
 
-Example (Colab cell, before starting the server):
+Only override the size to trade Bengali accuracy for latency:
 ```python
-%env WHISPER_MODEL_SIZE=small
+%env WHISPER_MODEL_SIZE=medium
 ```
+
+The Bengali script anchor (`BENGALI_INITIAL_PROMPT`) is applied only on
+`medium` and larger. On `small` it makes output *worse* — the model lacks
+the headroom to condition on the prompt and decode Bengali at once.
 
 The model is warmed up in the background at server startup so the first
 real utterance of a call doesn't pay the model download/load cost.
