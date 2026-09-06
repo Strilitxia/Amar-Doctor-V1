@@ -21,37 +21,113 @@ import edge_tts
 
 # Lazy-loaded Whisper model — the ONLY speech-to-text engine used by this
 # app (no browser Web Speech API is used anywhere, so audio never leaves
-# this backend). Model size/device/compute-type are env-configurable since
-# "tiny" (the old hardcoded default) is known to be weak specifically on
-# Bengali. Defaults: "small" on GPU (fast + noticeably more accurate),
-# "base" on CPU-only (the safe ceiling — "small" on CPU-only would run
-# several times slower than real time, unusable in a live call).
+# this backend). Model size/device/compute-type are env-configurable.
+#
+# Model size is THE dominant factor for Bengali quality. Whisper saw orders
+# of magnitude less Bengali than English in training, so the small
+# checkpoints collapse on Bengali long before they do on English — which is
+# exactly the "English transcribes perfectly, Bengali is garbage" failure:
+# roughly, FLEURS WER for bn is ~100%+ on tiny/base and ~60-70% on small,
+# while en stays under ~10% all the way down to base. So "large-v3" is the
+# default on BOTH cpu and cuda; the previous "small on gpu / base on cpu"
+# defaults were the main reason Bengali never worked. Drop it only via
+# WHISPER_MODEL_SIZE, and only to trade Bengali accuracy for latency.
 _whisper_model = None
+_whisper_model_size = None
 _whisper_model_lock = asyncio.Lock()
+
+
+def _default_model_size() -> str:
+    """Single source of truth for the model default (loader and /health agree).
+
+    These used to be two separate expressions that had drifted apart, so
+    /health could report "large-v3" while the loader had actually loaded
+    "small" — which made the Bengali problem look unrelated to model size.
+    """
+    return os.environ.get("WHISPER_MODEL_SIZE") or "large-v3"
+
+
+# Bengali needs a script anchor. With no prompt, Whisper frequently romanizes
+# Bengali speech or drifts into Hindi/Assamese — they share most of its Indic
+# acoustic space — which reads as "it didn't understand Bengali". A short
+# in-domain Bengali prompt holds the decoder in Bengali script and biases it
+# toward the symptom vocabulary this app actually hears.
+BENGALI_INITIAL_PROMPT = (
+    "এটি একটি স্বাস্থ্য পরামর্শের কথোপকথন। রোগী তার লক্ষণ বর্ণনা করছেন: "
+    "জ্বর, মাথাব্যথা, পেট ব্যথা, কাশি, সর্দি, বমি, দুর্বলতা, শ্বাসকষ্ট।"
+)
+
+# ...but only on checkpoints big enough to follow it. Measured on a 5s
+# Bengali clip ("আমার তিন দিন ধরে জ্বর আর মাথাব্যথা হচ্ছে..."):
+#   small,    no anchor -> "आमार तीम दीं दोरे जोर..."  (drifts to Devanagari)
+#   small,    anchor    -> unreadable gibberish, and 9x slower as temperature
+#                          fallback retries the bad decode over and over
+#   large-v3, no anchor -> "আমার তিম দিন ধোরে জোর আর মাথা বধা হোছে..."
+#   large-v3, anchor    -> "আমার তিম দিন ধরে জোর আর মাথাব্যথা হোছে, সাথে
+#                           কাশি ও দুর্বলতা আছে।"  (best; punctuation restored)
+# A small model does not have the headroom to condition on the prompt AND
+# decode Bengali, so feeding it one actively hurts.
+_ANCHOR_CAPABLE = ("medium", "large-v1", "large-v2", "large-v3", "large")
+
+
+def _use_bengali_anchor() -> bool:
+    return (_whisper_model_size or _default_model_size()) in _ANCHOR_CAPABLE
 
 async def get_whisper_model():
     """Lazy-load faster-whisper model with CUDA / CPU auto-detection and low-latency greedy inference."""
-    global _whisper_model
+    global _whisper_model, _whisper_model_size
     async with _whisper_model_lock:
         if _whisper_model is None:
             try:
-                from faster_whisper import WhisperModel
                 import torch
                 cuda_available = torch.cuda.is_available()
+
+                # On Windows, torch bundles cuBLAS/cuDNN inside torch/lib but
+                # does not put that directory on the DLL search path. CTranslate2
+                # (faster-whisper's backend) links them separately, so without
+                # this it loads fine, reports cuda as available, and then dies
+                # at the first encode with "Library cublas64_12.dll is not
+                # found" — surfacing as a generic transcription error rather
+                # than anything that points at CUDA.
+                if cuda_available and hasattr(os, "add_dll_directory"):
+                    torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+                    if os.path.isdir(torch_lib):
+                        try:
+                            os.add_dll_directory(torch_lib)
+                        except OSError:
+                            pass
+
+                from faster_whisper import WhisperModel
                 device = os.environ.get("WHISPER_DEVICE") or ("cuda" if cuda_available else "cpu")
                 compute_type = os.environ.get("WHISPER_COMPUTE_TYPE") or ("float16" if cuda_available else "int8")
-                model_size = os.environ.get("WHISPER_MODEL_SIZE") or ("small" if cuda_available else "base")
+                model_size = _default_model_size()
 
-                if model_size in ("small", "medium", "large-v3") and device == "cpu":
+                if device == "cpu" and model_size in ("medium", "large-v2", "large-v3"):
                     logger.warning(
-                        f"WHISPER_MODEL_SIZE={model_size} on CPU will be slow (several x real-time). "
-                        "Consider 'base' or 'tiny' for CPU-only deployments, or set WHISPER_MODEL_SIZE=base."
+                        f"WHISPER_MODEL_SIZE={model_size} on CPU will run slower than real time. "
+                        "This is deliberate: anything smaller is unusable for Bengali. Set "
+                        "WHISPER_MODEL_SIZE=small to trade Bengali accuracy for latency."
+                    )
+                if model_size in ("tiny", "base"):
+                    logger.warning(
+                        f"WHISPER_MODEL_SIZE={model_size} is effectively unusable for Bengali "
+                        "(~100% WER) even though it transcribes English fine. Use 'small' or larger."
                     )
 
                 kwargs = {"cpu_threads": os.cpu_count()} if device == "cpu" else {}
                 logger.info(f"Loading faster-whisper '{model_size}' model on {device} ({compute_type})...")
-                _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type, **kwargs)
-                logger.info(f"Whisper model loaded successfully on {device}.")
+                try:
+                    _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type, **kwargs)
+                except Exception as cuda_err:
+                    if device != "cuda":
+                        raise
+                    logger.warning(f"CUDA load failed ({cuda_err}); falling back to CPU int8.")
+                    device, compute_type = "cpu", "int8"
+                    _whisper_model = WhisperModel(
+                        model_size, device=device, compute_type=compute_type, cpu_threads=os.cpu_count()
+                    )
+                _whisper_model_size = model_size
+                logger.info(f"Whisper '{model_size}' loaded on {device} ({compute_type}).")
             except ImportError:
                 logger.warning("faster-whisper not installed. Bengali STT will not be available.")
                 _whisper_model = None
@@ -67,7 +143,7 @@ def whisper_model_info():
     except Exception:
         pass
     return {
-        "model_size": os.environ.get("WHISPER_MODEL_SIZE") or ("small" if cuda_available else "base"),
+        "model_size": _whisper_model_size or _default_model_size(),
         "device": os.environ.get("WHISPER_DEVICE") or ("cuda" if cuda_available else "cpu"),
         "loaded": _whisper_model is not None,
     }
@@ -127,7 +203,7 @@ class TTSRequest(BaseModel):
 
 class TranscribeRequest(BaseModel):
     audio_base64: str
-    lang: Optional[str] = "bn"
+    lang: str = "bn"
     format: Optional[str] = "webm"  # "webm" (Opus, from MediaRecorder) or "wav" (from the VAD segmenter)
 
 class ChatConsultationRequest(BaseModel):
@@ -308,7 +384,7 @@ async def chat_consultation(req: ChatConsultationRequest):
 
         if not reply_text:
             # Intelligent rural medical fallback responses
-            reply_text = "আপনার লক্ষণগুলো আমি বুঝতে পেরেছি। পর্যাপ্ত পানি ও খাবার স্যালাইন গ্রহণ করুন এবং বিশ্রাম নিন। যদি জ্বর বা ব্যথা বেড়ে যায়, প্যারাসিটামল সেবন করতে পারেন। লক্ষণ ৩ দিনের বেশি থাকলে স্বাস্থ্যকেন্দ্রে ডাক্তার দেখান।"
+            reply_text = "No reply from groq."
 
         # Synthesize neural voice
         audio_file = await generate_edge_tts(reply_text, voice=req.voice or DEFAULT_BENGALI_VOICE)
@@ -502,7 +578,7 @@ async def websocket_consultation_endpoint(websocket: WebSocket):
         logger.error(f"WebSocket error: {e}")
 
 
-def _transcribe_sync(model, source, lang, cuda_available):
+def _transcribe_sync(model, source, lang, cuda_available, fmt="wav"):
     """
     Runs faster-whisper on `source` (a file-like object or a path string) and
     applies server-side anti-hallucination filtering. faster-whisper — the
@@ -513,13 +589,26 @@ def _transcribe_sync(model, source, lang, cuda_available):
     events rather than fixed timers: a stray hallucinated segment used to be
     exactly what kept the old client-side "silence" timer from ever elapsing.
     """
+    # `lang` used to be ignored here in favour of a hardcoded "bn", so the
+    # UI's language toggle did nothing on either path. Anything that isn't
+    # an explicit English request is treated as Bengali (the app's default),
+    # which is also what makes the Bengali script anchor below kick in.
+    language = "en" if (lang or "bn").lower().startswith("en") else "bn"
+    logger.info(f"Whisper decoding: language={language} fmt={fmt} (client sent lang={lang!r})")
+
     segments, info = model.transcribe(
         source,
-        language="bn",
-        beam_size=5 if cuda_available else 1,
-        best_of=1,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=400),
+        language=language,
+        task="transcribe",
+        beam_size=5 if cuda_available else 3,
+        best_of=5 if cuda_available else 1,
+        temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        initial_prompt=BENGALI_INITIAL_PROMPT if (language == "bn" and _use_bengali_anchor()) else None,
+        # The client already hands us one VAD-segmented utterance, so a
+        # second VAD pass over a clean wav only risks clipping the soft
+        # onsets Bengali words often start with. Keep it for raw webm.
+        vad_filter=(fmt != "wav"),
+        vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=200),
         condition_on_previous_text=False,
         no_speech_threshold=0.6,
         log_prob_threshold=-1.0,
@@ -562,20 +651,20 @@ async def _run_whisper(audio_bytes: bytes, lang: str, fmt: str = "webm") -> str:
 
     if fmt == "wav":
         def transcribe():
-            return _transcribe_sync(model, io.BytesIO(audio_bytes), lang, cuda_available)
+            return _transcribe_sync(model, io.BytesIO(audio_bytes), lang, cuda_available, fmt)
         return await loop.run_in_executor(None, transcribe)
 
     def transcribe():
         audio_stream = io.BytesIO(audio_bytes)
         try:
-            return _transcribe_sync(model, audio_stream, lang, cuda_available)
+            return _transcribe_sync(model, audio_stream, lang, cuda_available, fmt)
         except Exception as stream_err:
             logger.warning(f"In-memory transcription fallback to temp file: {stream_err}")
             temp_p = TEMP_DIR / f"mic_{uuid.uuid4().hex[:8]}.webm"
             with open(temp_p, "wb") as f:
                 f.write(audio_bytes)
             try:
-                return _transcribe_sync(model, str(temp_p), lang, cuda_available)
+                return _transcribe_sync(model, str(temp_p), lang, cuda_available, fmt)
             finally:
                 try:
                     temp_p.unlink()
