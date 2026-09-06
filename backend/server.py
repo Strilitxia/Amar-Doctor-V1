@@ -18,6 +18,12 @@ from typing import Optional, List
 from pathlib import Path
 
 import edge_tts
+from dotenv import load_dotenv
+
+# The Groq key lives in the repo-root .env.local, which Next.js reads on its
+# own. Nothing was loading it on the Python side, so this server silently ran
+# keyless and answered every consultation with a canned string.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env.local")
 
 # Lazy-loaded Whisper model — the ONLY speech-to-text engine used by this
 # app (no browser Web Speech API is used anywhere, so audio never leaves
@@ -71,6 +77,18 @@ _ANCHOR_CAPABLE = ("medium", "large-v1", "large-v2", "large-v3", "large")
 
 
 def _use_bengali_anchor() -> bool:
+    """Whether to feed the Bengali script anchor to the decoder.
+
+    WHISPER_BENGALI_ANCHOR=on|off overrides the size-based guess, which is
+    what you want with a custom model: WHISPER_MODEL_SIZE also accepts a
+    HuggingFace repo id or a local CTranslate2 directory, and a Bengali
+    fine-tune neither needs the anchor nor matches a size name.
+    """
+    override = (os.environ.get("WHISPER_BENGALI_ANCHOR") or "auto").lower()
+    if override in ("on", "1", "true", "yes"):
+        return True
+    if override in ("off", "0", "false", "no"):
+        return False
     return (_whisper_model_size or _default_model_size()) in _ANCHOR_CAPABLE
 
 async def get_whisper_model():
@@ -173,6 +191,18 @@ app.add_middleware(
 
 
 @app.on_event("startup")
+async def _report_groq_key():
+    if os.environ.get("GROQ_API_KEY"):
+        logger.info("GROQ_API_KEY: present — clinical triage is live.")
+    else:
+        logger.error(
+            "GROQ_API_KEY: MISSING — no LLM will be called. Every consultation "
+            "will return a canned fallback that ignores what the patient says. "
+            "Put GROQ_API_KEY in .env.local at the repo root."
+        )
+
+
+@app.on_event("startup")
 async def _warmup_whisper_model():
     # Kick off model load in the background so the first real utterance on
     # the Whisper fallback tier doesn't pay the download/load cost — this
@@ -186,13 +216,69 @@ DEFAULT_ENGLISH_VOICE = "en-US-JennyNeural"
 TEMP_DIR = Path(tempfile.gettempdir()) / "amar_doctor_media"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# System prompt for the Groq (GPT-OSS-120B) Medical Assistant
-SYSTEM_PROMPT = """You are "Amar Doctor" (আমার ডাক্তার), a highly empathetic and knowledgeable AI medical consultant designed specifically for rural Bangladesh.
-- Triage symptoms and explain diagnoses in clear, reassuring Bengali (বাংলা) with English terms where appropriate.
-- Keep responses concise (2 to 4 sentences), direct, and easy to speak aloud via neural text-to-speech.
-- Suggest immediate first-aid, appropriate hydration/diet, and standard over-the-counter care.
-- If symptoms indicate critical emergencies (e.g. chest pain, snakebite, severe bleeding, stroke signs), urge immediate hospital visit or emergency SOS dispatch.
-- Always respond in Bengali (বাংলা) unless the user explicitly requests English. Avoid medical jargon; use simple, culturally relevant language."""
+# Shared by this server and app/api/chat/route.js — the two used to carry
+# separate copies that had already drifted apart.
+SYSTEM_PROMPT = (Path(__file__).resolve().parent / "prompts" / "triage_prompt.txt").read_text(encoding="utf-8")
+
+EMPTY_CASE_SHEET = {
+    "age": None, "sex": None, "chief_complaint": None, "onset": None,
+    "duration": None, "severity": None, "location": None,
+    "associated_symptoms": [], "aggravating_relieving": None, "meds_tried": [],
+    "history": [], "red_flags": [], "unknowns": [], "next_question": None,
+    "stage": "gathering",
+}
+
+
+def parse_triage_output(raw: str) -> tuple:
+    """Split the model's tagged output into (spoken reply, case sheet or None).
+
+    A sheet of None means "keep whatever the client already had" — losing the
+    accumulated case because one response came back malformed would be worse
+    than carrying a slightly stale sheet for one turn.
+    """
+    sheet = None
+
+    if "<case_sheet>" in raw:
+        block = raw.split("<case_sheet>", 1)[1].split("</case_sheet>", 1)[0]
+        try:
+            parsed = json.loads(block.strip())
+            if isinstance(parsed, dict):
+                sheet = parsed
+        except json.JSONDecodeError as e:
+            logger.warning(f"Case sheet was not valid JSON, carrying previous sheet forward: {e}")
+
+    # Split on the CLOSING tag first: the model routinely omits the opening
+    # <reply>, and keying off the opening tag let the closing tag and a
+    # half-finished JSON blob through to Edge-TTS to be read aloud.
+    reply = raw
+    if "</reply>" in reply:
+        reply = reply.split("</reply>", 1)[0]
+    if "<reply>" in reply:
+        reply = reply.split("<reply>", 1)[1]
+    # Truncation safety net — a partial sheet must never reach the patient.
+    reply = reply.split("<case_sheet>", 1)[0]
+
+    return reply.strip(), sheet
+
+
+def build_triage_messages(history, message: str, case_sheet, channel_suffix: str) -> list:
+    """System prompt + case sheet + verbatim window + the new utterance."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + channel_suffix}]
+
+    # Its own system message, so a long transcript can never bury it.
+    messages.append({
+        "role": "system",
+        "content": "CURRENT CASE SHEET:\n" + json.dumps(case_sheet or EMPTY_CASE_SHEET, ensure_ascii=False),
+    })
+
+    for h in (history or []):
+        messages.append({
+            "role": "assistant" if h.get("role") == "ai" else "user",
+            "content": h.get("content", ""),
+        })
+
+    messages.append({"role": "user", "content": message})
+    return messages
 
 # Request Models
 class TTSRequest(BaseModel):
@@ -211,6 +297,7 @@ class ChatConsultationRequest(BaseModel):
     voice: Optional[str] = DEFAULT_BENGALI_VOICE
     mode: Optional[str] = "audio" # "audio" or "video"
     history: Optional[List[dict]] = []
+    case_sheet: Optional[dict] = None
     groq_api_key: Optional[str] = None
 
 
@@ -239,10 +326,14 @@ async def call_groq(api_key: str, messages: list, max_output_tokens: int, timeou
 
     def _post():
         res = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        if res.status_code >= 400:
+            raise RuntimeError(f"Groq HTTP {res.status_code}: {res.text[:300]}")
         return res.json()
 
     loop = asyncio.get_event_loop()
     data = await loop.run_in_executor(None, _post)
+    if data.get("error"):
+        raise RuntimeError(f"Groq error: {data['error']}")
     choice = (data.get("choices") or [{}])[0]
     return ((choice.get("message") or {}).get("content") or "").strip()
 
@@ -364,27 +455,31 @@ async def chat_consultation(req: ChatConsultationRequest):
     try:
         api_key = req.groq_api_key or os.environ.get("GROQ_API_KEY")
         reply_text = ""
+        case_sheet = req.case_sheet
+        degraded_reason = None
 
         if api_key:
             try:
-                messages = [{
-                    "role": "system",
-                    "content": SYSTEM_PROMPT + " Always respond using short, concise sentences. Do not use complex formatting.",
-                }]
-                for h in (req.history or []):
-                    messages.append({
-                        "role": "assistant" if h.get("role") == "ai" else "user",
-                        "content": h.get("content", ""),
-                    })
-                messages.append({"role": "user", "content": req.message})
-
-                reply_text = await call_groq(api_key, messages, max_output_tokens=300, timeout=10)
+                messages = build_triage_messages(
+                    req.history, req.message, req.case_sheet,
+                    "Always respond using short, concise sentences. Do not use complex formatting.",
+                )
+                # gpt-oss-120b is a reasoning model: ~350-400 of these tokens
+                # go to internal reasoning before a single word is emitted.
+                raw = await call_groq(api_key, messages, max_output_tokens=1800, timeout=25)
+                reply_text, parsed_sheet = parse_triage_output(raw)
+                if parsed_sheet:
+                    case_sheet = parsed_sheet
             except Exception as groq_err:
-                logger.warning(f"Groq API request failed, using intelligent fallback: {groq_err}")
+                logger.error(f"Groq API request failed: {groq_err}")
+                degraded_reason = "groq_error"
+        else:
+            logger.error("No GROQ_API_KEY — returning a canned reply that ignores the patient.")
+            degraded_reason = "no_api_key"
 
         if not reply_text:
-            # Intelligent rural medical fallback responses
-            reply_text = "No reply from groq."
+            reply_text = "দুঃখিত, এই মুহূর্তে এআই ডাক্তারের সাথে সংযোগ করা যাচ্ছে না। অনুগ্রহ করে আবার চেষ্টা করুন।"
+            degraded_reason = degraded_reason or "empty_reply"
 
         # Synthesize neural voice
         audio_file = await generate_edge_tts(reply_text, voice=req.voice or DEFAULT_BENGALI_VOICE)
@@ -398,6 +493,9 @@ async def chat_consultation(req: ChatConsultationRequest):
             "reply": reply_text,
             "voice": req.voice,
             "mode": req.mode,
+            "case_sheet": case_sheet,
+            "degraded": degraded_reason is not None,
+            "degraded_reason": degraded_reason,
             "audio_base64": f"data:audio/mp3;base64,{audio_b64}"
         }
     except Exception as e:
@@ -476,7 +574,9 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
             user_msg = payload.get("message", "")
             voice = payload.get("voice", DEFAULT_BENGALI_VOICE)
             history = payload.get("history", [])
+            case_sheet = payload.get("case_sheet")
             api_key = payload.get("groq_api_key") or os.environ.get("GROQ_API_KEY")
+            degraded_reason = None
 
             await websocket.send_json({"type": "status", "status": "listening", "msg": "Processing prompt..."})
 
@@ -505,23 +605,26 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
 
             if api_key:
                 try:
-                    messages = [{
-                        "role": "system",
-                        "content": SYSTEM_PROMPT + " Always respond using short, concise sentences (under 12 words per sentence). Do not use bullet points or markdown.",
-                    }]
-                    for h in (history or []):
-                        messages.append({
-                            "role": "assistant" if h.get("role") == "ai" else "user",
-                            "content": h.get("content", ""),
-                        })
-                    messages.append({"role": "user", "content": user_msg})
-
-                    full_reply = await call_groq(api_key, messages, max_output_tokens=200, timeout=8)
+                    messages = build_triage_messages(
+                        history, user_msg, case_sheet,
+                        "Always respond using short, concise sentences (under 12 words per sentence). Do not use bullet points or markdown.",
+                    )
+                    raw = await call_groq(api_key, messages, max_output_tokens=1500, timeout=20)
+                    # Must strip the case sheet BEFORE chunking, or Edge-TTS
+                    # reads the raw JSON aloud to the patient.
+                    full_reply, parsed_sheet = parse_triage_output(raw)
+                    if parsed_sheet:
+                        case_sheet = parsed_sheet
                 except Exception as e:
-                    logger.warning(f"Groq streaming error: {e}")
+                    logger.error(f"Groq streaming error: {e}")
+                    degraded_reason = "groq_error"
+            else:
+                logger.error("No GROQ_API_KEY on voice call — returning a canned reply.")
+                degraded_reason = "no_api_key"
 
             if not full_reply:
-                full_reply = "আমি আপনার লক্ষণ বুঝতে পেরেছি। পর্যাপ্ত বিশ্রাম নিন ও খাবার স্যালাইন পান করুন। অবস্থা বেগতিক হলে দ্রুত হাসপাতালে যোগাযোগ করুন।"
+                full_reply = "দুঃখিত, এই মুহূর্তে সংযোগ করা যাচ্ছে না। অনুগ্রহ করে আবার চেষ্টা করুন।"
+                degraded_reason = degraded_reason or "empty_reply"
 
             # Punctuation-triggered chunking logic
             words = full_reply.split(" ")
@@ -537,7 +640,10 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
 
             await websocket.send_json({
                 "type": "response_complete",
-                "full_text": full_reply
+                "full_text": full_reply,
+                "case_sheet": case_sheet,
+                "degraded": degraded_reason is not None,
+                "degraded_reason": degraded_reason,
             })
 
     except WebSocketDisconnect:
@@ -604,11 +710,14 @@ def _transcribe_sync(model, source, lang, cuda_available, fmt="wav"):
         best_of=5 if cuda_available else 1,
         temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
         initial_prompt=BENGALI_INITIAL_PROMPT if (language == "bn" and _use_bengali_anchor()) else None,
-        # The client already hands us one VAD-segmented utterance, so a
-        # second VAD pass over a clean wav only risks clipping the soft
-        # onsets Bengali words often start with. Keep it for raw webm.
-        vad_filter=(fmt != "wav"),
-        vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=200),
+        # No server-side VAD on any path. Both client engines (Silero and the
+        # energy fallback) already emit exactly one segmented utterance, so a
+        # second pass here can only ever *remove* audio — including the soft
+        # onsets Bengali words often start with. Measured on a 5s clip the
+        # difference was one token either way, so this is not the accuracy
+        # lever it looks like; it is off because it has no upside, not
+        # because it was doing real damage.
+        vad_filter=False,
         condition_on_previous_text=False,
         no_speech_threshold=0.6,
         log_prob_threshold=-1.0,

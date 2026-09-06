@@ -16,6 +16,11 @@ const INITIAL_MESSAGES = [
   },
 ];
 
+// Verbatim turns sent with each request. The rolling case sheet carries
+// anything clinically important that falls outside this window.
+const HISTORY_WINDOW = 20;
+const SESSION_KEY = "amar_doctor_session";
+
 // Robust URL Sanitizer & WebSocket URL Generator
 const sanitizeBackendUrl = (url) => {
   if (!url) return "http://localhost:8000";
@@ -52,6 +57,8 @@ export default function ChatPage() {
   const [colabConnected, setColabConnected] = useState(false);
   const [showColabModal, setShowColabModal] = useState(false);
   const [selectedVoice, setSelectedVoice] = useState("bn-BD-NabanitaNeural");
+  const [caseSheet, setCaseSheet] = useState(null);
+  const [degradedReason, setDegradedReason] = useState(null);
 
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
@@ -74,6 +81,34 @@ export default function ChatPage() {
   const modeRef = useRef("text");
   const voiceLangRef = useRef("bn-BD");
 
+  // Conversation memory. These refs are written synchronously inside the
+  // setMessages updater rather than from a useEffect: an effect-synced mirror
+  // lags a render, and on rapid voice turns that dropped turns out of the
+  // history we sent — which is what made the AI look like it had amnesia.
+  const messagesRef = useRef(INITIAL_MESSAGES);
+  const caseSheetRef = useRef(null);
+
+  const appendMessage = (msg) => {
+    setMessages((prev) => {
+      const next = [...prev, msg];
+      messagesRef.current = next;
+      return next;
+    });
+  };
+
+  // The greeting carries no clinical information, so it never takes a slot.
+  const buildHistory = () =>
+    messagesRef.current
+      .filter((m) => m.id !== "welcome-1")
+      .slice(-HISTORY_WINDOW)
+      .map((m) => ({ role: m.role, content: m.content }));
+
+  const applyCaseSheet = (sheet) => {
+    if (!sheet) return;
+    caseSheetRef.current = sheet;
+    setCaseSheet(sheet);
+  };
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
@@ -81,6 +116,41 @@ export default function ChatPage() {
   useEffect(() => {
     scrollToBottom();
   }, [messages, isTyping, liveTranscript]);
+
+  // Hydrate in an effect, never in the useState initializer — sessionStorage
+  // doesn't exist during SSR/prerender, and starting from INITIAL_MESSAGES
+  // keeps the first paint identical to the server HTML.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
+      if (saved?.v === 1 && Array.isArray(saved.messages) && saved.messages.length) {
+        messagesRef.current = saved.messages;
+        setMessages(saved.messages);
+        caseSheetRef.current = saved.caseSheet || null;
+        setCaseSheet(saved.caseSheet || null);
+      }
+    } catch (e) {
+      console.warn("Could not restore session:", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    // Reference equality means nothing has been said yet, so this run is the
+    // mount pass — which fires BEFORE the hydrate effect's setMessages lands.
+    // Writing here would overwrite the saved transcript with a bare greeting
+    // and lose the consultation on every reload.
+    if (messages === INITIAL_MESSAGES) return;
+    try {
+      sessionStorage.setItem(
+        SESSION_KEY,
+        JSON.stringify({ v: 1, messages, caseSheet, updatedAt: Date.now() })
+      );
+    } catch (e) {
+      console.warn("Could not persist session:", e);
+    }
+  }, [messages, caseSheet]);
 
   useEffect(() => { isAvatarTalkingRef.current = isAvatarTalking; }, [isAvatarTalking]);
   useEffect(() => { isVoiceCallActiveRef.current = isVoiceCallActive; }, [isVoiceCallActive]);
@@ -167,7 +237,7 @@ export default function ChatPage() {
       time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     };
 
-    setMessages((prev) => [...prev, userMsg]);
+    appendMessage(userMsg);
     setIsTyping(true);
     setCallStatusText("🩺 AI Doctor is thinking...");
 
@@ -187,7 +257,8 @@ export default function ChatPage() {
             JSON.stringify({
               message: cleanText,
               voice: selectedVoice,
-              history: messages.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+              history: buildHistory(),
+              case_sheet: caseSheetRef.current,
             })
           );
         };
@@ -208,15 +279,14 @@ export default function ChatPage() {
                 streamPlayerRef.current.addChunk(payload.audio_base64);
               }
             } else if (payload.type === "response_complete") {
-              setMessages((prev) => [
-                ...prev,
-                {
-                  id: `ai-${Date.now()}`,
-                  role: "ai",
-                  content: payload.full_text,
-                  time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-                },
-              ]);
+              appendMessage({
+                id: `ai-${Date.now()}`,
+                role: "ai",
+                content: payload.full_text,
+                time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+              });
+              applyCaseSheet(payload.case_sheet);
+              setDegradedReason(payload.degraded ? payload.degraded_reason : null);
               setIsTyping(false);
             }
           } catch (e) {
@@ -238,7 +308,9 @@ export default function ChatPage() {
 
     // 2. Fallback REST API
     await fallbackRestCall(cleanText);
-  }, [colabConnected, colabUrl, selectedVoice, messages]);
+    // messagesRef removes the need for `messages` here — depending on it
+    // rebuilt this handler every single turn.
+  }, [colabConnected, colabUrl, selectedVoice]);
 
   useEffect(() => { handleTurnRef.current = handleInteractiveVoiceInput; }, [handleInteractiveVoiceInput]);
 
@@ -249,7 +321,8 @@ export default function ChatPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: transcriptText,
-          history: messages.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+          history: buildHistory(),
+          case_sheet: caseSheetRef.current,
         }),
       });
       const data = await res.json();
@@ -262,7 +335,9 @@ export default function ChatPage() {
         time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       };
 
-      setMessages((prev) => [...prev, aiMsg]);
+      appendMessage(aiMsg);
+      applyCaseSheet(data.case_sheet);
+      setDegradedReason(data.degraded ? data.degraded_reason : null);
       speakMessage(aiMsg.id, aiReplyText);
     } catch {
       console.warn("Rest call failed");
@@ -423,7 +498,15 @@ export default function ChatPage() {
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        // echoCancellation stays on — AI replies play out of the speakers and
+        // would otherwise be re-captured, breaking barge-in. noiseSuppression
+        // and autoGainControl are off on purpose: both are tuned to make
+        // speech pleasant for a human listener, and both work by gating or
+        // rescaling low-energy audio, which is exactly the soft word-initial
+        // sounds Whisper needs. Whisper is trained on noisy audio and copes
+        // with room noise far better than with the spectral artifacts a
+        // denoiser leaves behind.
+        audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
       });
     } catch (micErr) {
       alert("Microphone permission required for voice calls: " + micErr.message);
@@ -488,7 +571,15 @@ export default function ChatPage() {
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        // echoCancellation stays on — AI replies play out of the speakers and
+        // would otherwise be re-captured, breaking barge-in. noiseSuppression
+        // and autoGainControl are off on purpose: both are tuned to make
+        // speech pleasant for a human listener, and both work by gating or
+        // rescaling low-energy audio, which is exactly the soft word-initial
+        // sounds Whisper needs. Whisper is trained on noisy audio and copes
+        // with room noise far better than with the spectral artifacts a
+        // denoiser leaves behind.
+        audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
       });
     } catch (err) {
       alert("Microphone permission required for voice dictation: " + err.message);
@@ -638,13 +729,15 @@ export default function ChatPage() {
       time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     };
 
-    setMessages((prev) => [...prev, userMsg]);
+    appendMessage(userMsg);
     setInput("");
     setIsTyping(true);
 
     try {
       let aiReplyText = "";
       let neuralAudioB64 = null;
+      let nextSheet = null;
+      let nextDegraded = null;
 
       if (colabConnected && colabUrl) {
         try {
@@ -656,12 +749,20 @@ export default function ChatPage() {
               message: text,
               voice: selectedVoice,
               mode: mode,
-              history: messages.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+              history: buildHistory(),
+              case_sheet: caseSheetRef.current,
             }),
           });
           const colabData = await colabRes.json();
-          aiReplyText = colabData.reply;
-          neuralAudioB64 = colabData.audio_base64;
+          // A degraded reply is a canned string, not an answer — let it fall
+          // through to the Next.js route, which may still have a working key.
+          if (!colabData.degraded) {
+            aiReplyText = colabData.reply;
+            neuralAudioB64 = colabData.audio_base64;
+            nextSheet = colabData.case_sheet;
+          } else {
+            console.warn("Backend degraded:", colabData.degraded_reason);
+          }
         } catch (colabErr) {
           console.warn("Colab API error, fallback to Next.js API:", colabErr);
         }
@@ -673,12 +774,18 @@ export default function ChatPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             message: text,
-            history: messages.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+            history: buildHistory(),
+            case_sheet: caseSheetRef.current,
           }),
         });
         const data = await res.json();
         aiReplyText = data.reply || "I'm sorry, I couldn't process that. Please try again.";
+        nextSheet = data.case_sheet;
+        nextDegraded = data.degraded ? data.degraded_reason : null;
       }
+
+      applyCaseSheet(nextSheet);
+      setDegradedReason(nextDegraded);
 
       const aiMsg = {
         id: `ai-${Date.now()}`,
@@ -687,7 +794,7 @@ export default function ChatPage() {
         time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       };
 
-      setMessages((prev) => [...prev, aiMsg]);
+      appendMessage(aiMsg);
 
       if (mode === "audio" || mode === "video") {
         if (neuralAudioB64) {
@@ -703,10 +810,23 @@ export default function ChatPage() {
         content: "Sorry, there was an error connecting to the AI service. Please check your connection.",
         time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       };
-      setMessages((prev) => [...prev, errMsg]);
+      appendMessage(errMsg);
     } finally {
       setIsTyping(false);
     }
+  };
+
+  const startNewConsultation = () => {
+    if (voiceWsRef.current) {
+      try { voiceWsRef.current.close(); } catch {}
+      voiceWsRef.current = null;
+    }
+    messagesRef.current = INITIAL_MESSAGES;
+    caseSheetRef.current = null;
+    setMessages(INITIAL_MESSAGES);
+    setCaseSheet(null);
+    setDegradedReason(null);
+    try { sessionStorage.removeItem(SESSION_KEY); } catch {}
   };
 
   const handleKeyDown = (e) => {
@@ -745,6 +865,16 @@ export default function ChatPage() {
             {colabConnected ? "⚡ Backend Connected" : "🔌 Connect Backend (Colab/Local)"}
           </button>
 
+          <button
+            className="btn-ghost"
+            onClick={startNewConsultation}
+            style={{ padding: "4px 12px", fontSize: 11 }}
+            id="new-consultation-btn"
+            title="Clear this consultation and start fresh"
+          >
+            🔄 New
+          </button>
+
           {/* Mode Toggle (Text / Audio Call / Video Call) */}
           <div className="chat-mode-toggle">
             <button
@@ -770,6 +900,23 @@ export default function ChatPage() {
             </button>
           </div>
         </div>
+
+        {degradedReason && (
+          <div
+            style={{
+              padding: "8px 16px",
+              background: "rgba(255, 176, 32, 0.12)",
+              borderBottom: "1px solid rgba(255, 176, 32, 0.4)",
+              color: "#ffb020",
+              fontSize: 12,
+            }}
+            id="degraded-banner"
+          >
+            {degradedReason === "no_api_key"
+              ? "⚠️ Demo mode — no GROQ_API_KEY configured. Replies are canned and ignore your symptoms. Add the key to .env.local and restart both servers."
+              : `⚠️ AI service unavailable (${degradedReason}) — replies are not from the AI model.`}
+          </div>
+        )}
 
         {/* Interactive Video / Audio Call Stage Area */}
         {mode !== "text" && (

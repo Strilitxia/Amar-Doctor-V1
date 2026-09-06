@@ -71,7 +71,33 @@ Only override the size to trade Bengali accuracy for latency:
 
 The Bengali script anchor (`BENGALI_INITIAL_PROMPT`) is applied only on
 `medium` and larger. On `small` it makes output *worse* — the model lacks
-the headroom to condition on the prompt and decode Bengali at once.
+the headroom to condition on the prompt and decode Bengali at once. Force
+it either way with `WHISPER_BENGALI_ANCHOR=on|off`.
+
+### If Bengali is understandable but individual words are wrong
+
+Stock `large-v3` gets Bengali *script* right but still mis-renders conjunct
+consonants — `জ্বর` (fever) comes out as `জোর` (force), `হচ্ছে` as `হোছে`.
+Measured on a 5s clip, these survive every audio-side change: server VAD on
+or off, and up to 300ms of onset trimmed off, all produce the same three
+errors. They are model limits, not pipeline bugs, so do not go looking for
+them in the VAD or the audio format.
+
+Widening `BENGALI_INITIAL_PROMPT` is whack-a-mole: adding example sentences
+fixed `তিন` and `হচ্ছে` but broke `মাথাব্যথা` -> `মাথাব্বথা` and
+`দুর্বলতা` -> `দুরবলতা`. Same error count, different errors.
+
+The real fix is a Bengali fine-tuned checkpoint. `WHISPER_MODEL_SIZE`
+accepts a HuggingFace repo id or a local CTranslate2 directory, not just a
+size name, so swapping one in is an env var:
+
+```bash
+ct2-transformers-converter --model <hf-bengali-whisper-repo>   --output_dir ./models/whisper-bn --quantization float16
+```
+```python
+%env WHISPER_MODEL_SIZE=./models/whisper-bn
+%env WHISPER_BENGALI_ANCHOR=off
+```
 
 The model is warmed up in the background at server startup so the first
 real utterance of a call doesn't pay the model download/load cost.
