@@ -225,8 +225,49 @@ EMPTY_CASE_SHEET = {
     "duration": None, "severity": None, "location": None,
     "associated_symptoms": [], "aggravating_relieving": None, "meds_tried": [],
     "history": [], "red_flags": [], "unknowns": [], "next_question": None,
-    "stage": "gathering",
+    "next_question_field": None, "asked_counts": {}, "stage": "gathering",
 }
+
+# Everything the patient told us. A re-emitted sheet may omit these; the
+# control fields (unknowns/next_question/stage) are recomputed every turn and
+# must always take the new value.
+CLINICAL_FIELDS = (
+    "age", "sex", "chief_complaint", "onset", "duration", "severity", "location",
+    "associated_symptoms", "aggravating_relieving", "meds_tried", "history", "red_flags",
+)
+
+# Ask about the same thing this many times and we stop asking, for good.
+MAX_ASKS_PER_FIELD = 2
+# Questions asked before we force an assessment, so the patient always gets one.
+MAX_GATHERING_EXCHANGES = 6
+
+
+def merge_case_sheet(old: dict, new: dict) -> dict:
+    """Fold a freshly emitted sheet into the accumulated one.
+
+    The model rewrites the whole sheet every turn, and on a long consultation it
+    silently drops fields it had already filled. Replacing wholesale meant a
+    known answer could revert to null and the model would ask for it again —
+    the re-asking loop. A field only changes when the model has something to put
+    in it; clearing one requires the model to send a new value, not an omission.
+    """
+    if not new:
+        return old
+    merged = dict(old) if old else dict(EMPTY_CASE_SHEET)
+
+    for k, v in new.items():
+        if k in CLINICAL_FIELDS and (v is None or v == [] or v == ""):
+            continue
+        merged[k] = v
+
+    # Count asks per field here rather than trusting the model to keep score.
+    counts = dict((old or {}).get("asked_counts") or {})
+    field = new.get("next_question_field")
+    if field:
+        counts[field] = counts.get(field, 0) + 1
+    merged["asked_counts"] = counts
+
+    return merged
 
 
 def parse_triage_output(raw: str) -> tuple:
@@ -262,14 +303,36 @@ def parse_triage_output(raw: str) -> tuple:
 
 
 def build_triage_messages(history, message: str, case_sheet, channel_suffix: str) -> list:
-    """System prompt + case sheet + verbatim window + the new utterance."""
+    """System prompt + case sheet + hard directives + verbatim window + utterance."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + channel_suffix}]
 
+    sheet = case_sheet or EMPTY_CASE_SHEET
+    context = ["CURRENT CASE SHEET:", json.dumps(sheet, ensure_ascii=False)]
+
+    # Asking politely in the prompt is not enough — a patient who cannot answer
+    # (or whose speech keeps mis-transcribing) would otherwise be asked the same
+    # question until the call ends. These are computed, not suggested.
+    exhausted = [f for f, c in (sheet.get("asked_counts") or {}).items() if c >= MAX_ASKS_PER_FIELD]
+    if exhausted:
+        context.append(
+            "\nALREADY ASKED, DO NOT ASK AGAIN: " + ", ".join(exhausted) +
+            ". The patient has been asked about these and could not give a usable answer. "
+            "Leave them null, remove them from unknowns, and move on to something else. "
+            "Asking again is a serious error."
+        )
+
+    asked_so_far = sum(1 for h in (history or []) if h.get("role") == "ai")
+    if asked_so_far >= MAX_GATHERING_EXCHANGES and sheet.get("stage") != "closed":
+        context.append(
+            f"\nYou have already had {asked_so_far} exchanges. STOP GATHERING NOW. "
+            "In THIS reply give your assessment using whatever you already know: the likely cause, "
+            "what to do right now, and when to see a doctor. Ask NO further questions. "
+            'Set stage to "assessing" and next_question to null. '
+            "The patient came for help and must not leave without an answer."
+        )
+
     # Its own system message, so a long transcript can never bury it.
-    messages.append({
-        "role": "system",
-        "content": "CURRENT CASE SHEET:\n" + json.dumps(case_sheet or EMPTY_CASE_SHEET, ensure_ascii=False),
-    })
+    messages.append({"role": "system", "content": "\n".join(context)})
 
     for h in (history or []):
         messages.append({
@@ -304,6 +367,10 @@ class ChatConsultationRequest(BaseModel):
 GROQ_MODEL = "openai/gpt-oss-120b"
 
 
+class RateLimited(RuntimeError):
+    """Groq's tokens-per-minute ceiling, still hit after retrying."""
+
+
 async def call_groq(api_key: str, messages: list, max_output_tokens: int, timeout: float) -> str:
     """
     Call Groq's OpenAI-compatible chat completions API (model: GPT-OSS-120B)
@@ -324,17 +391,51 @@ async def call_groq(api_key: str, messages: list, max_output_tokens: int, timeou
         "max_tokens": max_output_tokens,
     }
 
+    import re
+    import time
+
     def _post():
-        res = requests.post(url, json=payload, headers=headers, timeout=timeout)
-        if res.status_code >= 400:
-            raise RuntimeError(f"Groq HTTP {res.status_code}: {res.text[:300]}")
-        return res.json()
+        # Groq's free tier bills the REQUESTED max_tokens against the
+        # tokens-per-minute ceiling, not the tokens actually produced, so a
+        # generous budget alone can trip 429s. The retry-after it hands back is
+        # typically only a few hundred milliseconds — worth waiting out rather
+        # than failing the consultation.
+        for attempt in range(3):
+            res = requests.post(url, json=payload, headers=headers, timeout=timeout)
+
+            if res.status_code == 429 and attempt < 2:
+                delay = res.headers.get("retry-after")
+                wait = float(delay) if delay else 0.0
+                if not wait:
+                    m = re.search(r"try again in ([\d.]+)(ms|s)", res.text)
+                    wait = float(m.group(1)) / (1000 if m.group(2) == "ms" else 1) if m else 1.0
+                logger.warning(f"Groq rate limit, retrying in {wait:.2f}s")
+                time.sleep(min(wait + 0.25, 5))
+                continue
+
+            if res.status_code == 429:
+                raise RateLimited(res.text[:300])
+            if res.status_code >= 400:
+                raise RuntimeError(f"Groq HTTP {res.status_code}: {res.text[:300]}")
+            return res.json()
 
     loop = asyncio.get_event_loop()
     data = await loop.run_in_executor(None, _post)
     if data.get("error"):
         raise RuntimeError(f"Groq error: {data['error']}")
+
     choice = (data.get("choices") or [{}])[0]
+    # This model spends most of its completion budget on hidden reasoning
+    # (800+ tokens is normal here), so a budget that looks generous can still
+    # truncate the answer to nothing. Say so instead of returning "".
+    if choice.get("finish_reason") == "length":
+        usage = data.get("usage") or {}
+        logger.error(
+            f"Groq hit the token ceiling (max_tokens={max_output_tokens}, "
+            f"reasoning={usage.get('completion_tokens_details', {}).get('reasoning_tokens')}, "
+            f"completion={usage.get('completion_tokens')}). Reply was truncated."
+        )
+
     return ((choice.get("message") or {}).get("content") or "").strip()
 
 
@@ -464,12 +565,17 @@ async def chat_consultation(req: ChatConsultationRequest):
                     req.history, req.message, req.case_sheet,
                     "Always respond using short, concise sentences. Do not use complex formatting.",
                 )
-                # gpt-oss-120b is a reasoning model: ~350-400 of these tokens
-                # go to internal reasoning before a single word is emitted.
-                raw = await call_groq(api_key, messages, max_output_tokens=1800, timeout=25)
+                # gpt-oss-120b is a reasoning model: 800-1400 of these tokens go
+                # to hidden reasoning before a single word is emitted. Budget for
+                # that, but no higher — the free tier counts what we REQUEST
+                # against its per-minute ceiling, so an oversized ask rate-limits
+                # the next turn of the same conversation.
+                raw = await call_groq(api_key, messages, max_output_tokens=2200, timeout=30)
                 reply_text, parsed_sheet = parse_triage_output(raw)
-                if parsed_sheet:
-                    case_sheet = parsed_sheet
+                case_sheet = merge_case_sheet(req.case_sheet, parsed_sheet)
+            except RateLimited as limit_err:
+                logger.error(f"Groq rate limit exhausted: {limit_err}")
+                degraded_reason = "rate_limited"
             except Exception as groq_err:
                 logger.error(f"Groq API request failed: {groq_err}")
                 degraded_reason = "groq_error"
@@ -478,7 +584,11 @@ async def chat_consultation(req: ChatConsultationRequest):
             degraded_reason = "no_api_key"
 
         if not reply_text:
-            reply_text = "দুঃখিত, এই মুহূর্তে এআই ডাক্তারের সাথে সংযোগ করা যাচ্ছে না। অনুগ্রহ করে আবার চেষ্টা করুন।"
+            reply_text = (
+                "এক মিনিট অপেক্ষা করে আবার বলুন, সার্ভার এখন ব্যস্ত আছে।"
+                if degraded_reason == "rate_limited"
+                else "দুঃখিত, এই মুহূর্তে এআই ডাক্তারের সাথে সংযোগ করা যাচ্ছে না। অনুগ্রহ করে আবার চেষ্টা করুন।"
+            )
             degraded_reason = degraded_reason or "empty_reply"
 
         # Synthesize neural voice
@@ -609,12 +719,14 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
                         history, user_msg, case_sheet,
                         "Always respond using short, concise sentences (under 12 words per sentence). Do not use bullet points or markdown.",
                     )
-                    raw = await call_groq(api_key, messages, max_output_tokens=1500, timeout=20)
+                    raw = await call_groq(api_key, messages, max_output_tokens=2000, timeout=25)
                     # Must strip the case sheet BEFORE chunking, or Edge-TTS
                     # reads the raw JSON aloud to the patient.
                     full_reply, parsed_sheet = parse_triage_output(raw)
-                    if parsed_sheet:
-                        case_sheet = parsed_sheet
+                    case_sheet = merge_case_sheet(case_sheet, parsed_sheet)
+                except RateLimited as limit_err:
+                    logger.error(f"Groq rate limit exhausted on voice call: {limit_err}")
+                    degraded_reason = "rate_limited"
                 except Exception as e:
                     logger.error(f"Groq streaming error: {e}")
                     degraded_reason = "groq_error"

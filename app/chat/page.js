@@ -914,6 +914,8 @@ export default function ChatPage() {
           >
             {degradedReason === "no_api_key"
               ? "⚠️ Demo mode — no GROQ_API_KEY configured. Replies are canned and ignore your symptoms. Add the key to .env.local and restart both servers."
+              : degradedReason === "rate_limited"
+              ? "⏳ Groq rate limit reached (free tier allows 8,000 tokens/minute). Wait about a minute and try again — your consultation is not lost."
               : `⚠️ AI service unavailable (${degradedReason}) — replies are not from the AI model.`}
           </div>
         )}
