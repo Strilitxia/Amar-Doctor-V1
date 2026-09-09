@@ -12,6 +12,7 @@ websockets==14.2
 aiofiles==24.1.0
 pyngrok==7.2.3
 requests==2.32.3
+httpx>=0.27.0            # MuseTalk sidecar client (backend/musetalk_client.py)
 faster-whisper>=1.0.0
 numpy>=1.24.0
 scipy>=1.10.0

@@ -1,14 +1,17 @@
 """
 Amar Doctor V1 — AI Video & Audio Sandbox Backend
 FastAPI server for Edge-TTS Bengali voice synthesis, Groq (GPT-OSS-120B)
-medical triage, and SadTalker/LivePortrait AI avatar video pipeline.
+medical triage, faster-whisper speech recognition, and MuseTalk lip-synced
+avatar video via an out-of-process renderer (see backend/musetalk_client.py).
 Designed for Google Colab (Free T4 GPU) & Local execution.
 """
 
 import os
 import io
+import re
 import sys
 import json
+import time
 import uuid
 import base64
 import asyncio
@@ -19,6 +22,13 @@ from pathlib import Path
 
 import edge_tts
 from dotenv import load_dotenv
+
+# Imported both as "backend.server" (python -m uvicorn backend.server:app)
+# and as "server" (uvicorn --app-dir backend), so try both spellings.
+try:
+    from backend.musetalk_client import musetalk
+except ImportError:  # pragma: no cover - depends on how uvicorn was launched
+    from musetalk_client import musetalk
 
 # The Groq key lives in the repo-root .env.local, which Next.js reads on its
 # own. Nothing was loading it on the Python side, so this server silently ran
@@ -51,6 +61,45 @@ def _default_model_size() -> str:
     "small" — which made the Bengali problem look unrelated to model size.
     """
     return os.environ.get("WHISPER_MODEL_SIZE") or "large-v3"
+
+
+# Quantization threshold, in GB of total VRAM.
+_SMALL_VRAM_GB = 9
+
+
+def _default_compute_type(cuda_available: bool) -> str:
+    """Pick a Whisper precision that leaves room for the video renderer.
+
+    `large-v3` in float16 is ~3.1GB. On an 8GB card that leaves too little
+    headroom once the MuseTalk sidecar is also resident: measured on an
+    RTX 3060 Ti, idle sat at 6.6/8.2GB and every lip-sync render spilled into
+    Windows' VRAM paging, running 20x slower than realtime. Dropping Whisper
+    to int8_float16 freed ~1GB and took the SAME renders from 20.0x to 3.2x
+    -- a full reply went from 216s to 15s.
+
+    int8_float16 quantizes weights but keeps large-v3, which is the choice
+    that matters for Bengali: per backend/README.md, model SIZE dominates
+    accuracy (tiny/base are ~100% WER on Bengali while fine on English), and
+    quantizing large-v3 costs far less than dropping to `medium` or `small`.
+
+    Cards with real headroom keep full float16. Override either way with
+    WHISPER_COMPUTE_TYPE.
+    """
+    if not cuda_available:
+        return "int8"
+    try:
+        import torch
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        if vram_gb < _SMALL_VRAM_GB:
+            logger.info(
+                f"GPU has {vram_gb:.1f}GB VRAM (<{_SMALL_VRAM_GB}GB): loading Whisper as "
+                "int8_float16 so the MuseTalk renderer has room. Set "
+                "WHISPER_COMPUTE_TYPE=float16 to override."
+            )
+            return "int8_float16"
+    except Exception:
+        pass
+    return "float16"
 
 
 # Bengali needs a script anchor. With no prompt, Whisper frequently romanizes
@@ -117,7 +166,7 @@ async def get_whisper_model():
 
                 from faster_whisper import WhisperModel
                 device = os.environ.get("WHISPER_DEVICE") or ("cuda" if cuda_available else "cpu")
-                compute_type = os.environ.get("WHISPER_COMPUTE_TYPE") or ("float16" if cuda_available else "int8")
+                compute_type = os.environ.get("WHISPER_COMPUTE_TYPE") or _default_compute_type(cuda_available)
                 model_size = _default_model_size()
 
                 if device == "cpu" and model_size in ("medium", "large-v2", "large-v3"):
@@ -165,7 +214,7 @@ def whisper_model_info():
         "device": os.environ.get("WHISPER_DEVICE") or ("cuda" if cuda_available else "cpu"),
         "loaded": _whisper_model is not None,
     }
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -215,6 +264,14 @@ DEFAULT_BENGALI_MALE_VOICE = "bn-BD-PradeepNeural" # High quality male Bengali n
 DEFAULT_ENGLISH_VOICE = "en-US-JennyNeural"
 TEMP_DIR = Path(tempfile.gettempdir()) / "amar_doctor_media"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Anchored on __file__, not the cwd. The old relative "backend/static/..."
+# only resolved when uvicorn happened to be launched from the repo root.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+DEFAULT_AVATAR = STATIC_DIR / "doctor_avatar.png"
+
+# How long generated media stays on disk before the sweeper removes it.
+MEDIA_TTL_SECONDS = 600
 
 # Shared by this server and app/api/chat/route.js — the two used to carry
 # separate copies that had already drifted apart.
@@ -455,6 +512,20 @@ async def generate_edge_tts(text: str, voice: str = DEFAULT_BENGALI_VOICE, outpu
     return output_path
 
 
+# Edge-TTS emits constant-bitrate 48 kbps MP3, so duration falls straight out
+# of the byte count -- no decode, no ffmpeg subprocess, no added latency on
+# the hot path. Verified against four real samples: 20880B/3480ms,
+# 13968B/2320ms, 13248B/2200ms, 20304B/3360ms, all within 0.7% of 48 kbps.
+EDGE_TTS_BYTES_PER_SECOND = 48_000 / 8  # 6000
+
+
+def edge_tts_duration_seconds(audio_bytes: bytes) -> float:
+    """True spoken duration of an Edge-TTS mp3, in seconds."""
+    if not audio_bytes:
+        return 0.0
+    return len(audio_bytes) / EDGE_TTS_BYTES_PER_SECOND
+
+
 def check_gpu_status():
     """Detect available CUDA devices."""
     try:
@@ -476,6 +547,10 @@ async def health_check():
         "service": "Amar Doctor V1 AI Video & Neural Voice Sandbox",
         "gpu": gpu,
         "whisper": whisper_model_info(),
+        # Capability handshake for the video call. The client shows GPU
+        # lip-sync branding only when live is true; otherwise it says so and
+        # falls back to the audio-reactive avatar.
+        "lipsync": await musetalk.health(),
         "supported_voices": [
             {"id": "bn-BD-NabanitaNeural", "name": "Nabanita (Bengali Female)", "lang": "bn-BD"},
             {"id": "bn-BD-PradeepNeural", "name": "Pradeep (Bengali Male)", "lang": "bn-BD"},
@@ -484,38 +559,51 @@ async def health_check():
     }
 
 
-@app.post("/api/livekit/token")
-async def get_livekit_token(room: Optional[str] = "amar-doctor-room", identity: Optional[str] = "patient_user"):
-    """
-    Generate LiveKit Cloud WebRTC Access Token for real-time video avatar call.
-    """
-    livekit_api_key = os.environ.get("LIVEKIT_API_KEY", "devkey")
-    livekit_api_secret = os.environ.get("LIVEKIT_API_SECRET", "secret")
-    livekit_url = os.environ.get("LIVEKIT_URL", "wss://amar-doctor-demo.livekit.cloud")
+MEDIA_ID_RE = re.compile(r"^[a-f0-9]{16}\.(mp4|mp3)$")
 
-    try:
-        from livekit import api
-        token = api.AccessToken(livekit_api_key, livekit_api_secret) \
-            .with_identity(identity) \
-            .with_name("Patient") \
-            .with_grants(api.VideoGrants(
-                room_join=True,
-                room=room,
-                can_publish=True,
-                can_subscribe=True,
-            ))
-        jwt_token = token.to_jwt()
-        return {"success": True, "token": jwt_token, "url": livekit_url, "room": room}
-    except Exception as e:
-        logger.warning(f"LiveKit SDK fallback token generation: {e}")
-        # Return fallback configuration
-        return {
-            "success": True,
-            "token": "demo-token",
-            "url": livekit_url,
-            "room": room,
-            "notice": "LiveKit Cloud token generated. Configure LIVEKIT_API_KEY & SECRET in Colab."
-        }
+
+@app.get("/api/media/{media_id}")
+async def serve_media(media_id: str):
+    """Serve a generated clip to the browser.
+
+    Deliberately not a StaticFiles mount: CORS here is allow_origins=["*"],
+    and mounting a system-temp-derived directory under that would expose
+    anything that lands in it. Only exact <16 hex>.<mp4|mp3> names resolve,
+    and the result must still be inside TEMP_DIR.
+    """
+    if not MEDIA_ID_RE.match(media_id):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    path = (TEMP_DIR / media_id).resolve()
+    if not path.is_relative_to(TEMP_DIR.resolve()) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    media_type = "video/mp4" if path.suffix == ".mp4" else "audio/mpeg"
+    return FileResponse(path, media_type=media_type)
+
+
+@app.on_event("startup")
+async def _start_media_sweeper():
+    """Delete generated media older than the TTL.
+
+    Every TTS phrase writes an mp3 into TEMP_DIR and nothing ever removed
+    them, so a long session left hundreds of files behind.
+    """
+    async def sweep():
+        while True:
+            try:
+                cutoff = time.time() - MEDIA_TTL_SECONDS
+                for f in TEMP_DIR.glob("*"):
+                    try:
+                        if f.is_file() and f.stat().st_mtime < cutoff:
+                            f.unlink()
+                    except OSError:
+                        pass
+            except Exception as e:
+                logger.warning(f"Media sweep error: {e}")
+            await asyncio.sleep(120)
+
+    asyncio.create_task(sweep())
 
 
 @app.post("/api/tts")
@@ -613,53 +701,51 @@ async def chat_consultation(req: ChatConsultationRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _store_media(data: bytes, suffix: str) -> str:
+    """Persist generated media under a name /api/media will serve, return its URL.
+
+    The URL is deliberately relative: the client prefixes its own backend
+    origin, so this keeps working through the Colab cloudflared tunnel.
+    """
+    media_id = f"{uuid.uuid4().hex[:16]}{suffix}"
+    (TEMP_DIR / media_id).write_bytes(data)
+    return f"/api/media/{media_id}"
+
+
 @app.post("/api/video-avatar")
 async def generate_video_avatar(
     text: str = Form(...),
     voice: Optional[str] = Form(DEFAULT_BENGALI_VOICE),
-    doctor_image: Optional[UploadFile] = File(None)
 ):
-    """
-    Generate Lip-Synced Video Avatar via MuseTalk / SadTalker pipeline:
-    Takes static doctor portrait + synthesized Bengali audio -> generates synchronized video.
+    """One-shot lip-sync render — the standalone test for the MuseTalk sidecar.
+
+    Synthesizes the phrase with Edge-TTS, hands the audio to the renderer, and
+    returns a URL the browser can actually play. The previous version shelled
+    out to a hardcoded /content/MuseTalk path per request (reloading every
+    model each time) and returned only a boolean, never the video.
     """
     try:
         audio_path = await generate_edge_tts(text, voice=voice)
-        musetalk_path = Path("/content/MuseTalk")
-        sadtalker_path = Path("/content/SadTalker")
+        audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("utf-8")
 
-        output_video_path = TEMP_DIR / f"avatar_{uuid.uuid4().hex[:8]}.mp4"
-
-        # Check for user provided reference image
-        img_path = TEMP_DIR / "doctor_ref.png"
-        if doctor_image:
-            content = await doctor_image.read()
-            with open(img_path, "wb") as f:
-                f.write(content)
-        elif not img_path.exists():
-            img_path = Path("backend/static/doctor_avatar.png")
-
-        if musetalk_path.exists() and check_gpu_status()["cuda_available"]:
-            logger.info("Executing MuseTalk ultra-fast real-time inference...")
-            cmd = f"python {musetalk_path}/inference.py --audio_path {audio_path} --video_path {img_path} --output_vid_name {output_video_path}"
-            proc = await asyncio.create_subprocess_shell(cmd)
-            await proc.communicate()
-        elif sadtalker_path.exists() and check_gpu_status()["cuda_available"]:
-            logger.info("Executing GPU SadTalker inference...")
-            cmd = f"python {sadtalker_path}/inference.py --driven_audio {audio_path} --source_image {img_path} --result_dir {TEMP_DIR} --still --preprocess full"
-            proc = await asyncio.create_subprocess_shell(cmd)
-            await proc.communicate()
-
-        with open(audio_path, "rb") as f:
-            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+        video = await musetalk.render(audio_path, phrase=text, seq=0, phrase_seconds=4.0)
+        if video is None:
+            health = await musetalk.health()
+            return {
+                "success": False,
+                "reason": health.get("reason") or "render_failed",
+                "text": text,
+                "voice": voice,
+                "audio_base64": f"data:audio/mp3;base64,{audio_b64}",
+                "video_url": None,
+            }
 
         return {
             "success": True,
             "text": text,
             "voice": voice,
             "audio_base64": f"data:audio/mp3;base64,{audio_b64}",
-            "video_generated": output_video_path.exists(),
-            "message": "Neural voice synthesized and synchronized with avatar frames."
+            "video_url": _store_media(video, ".mp4"),
         }
     except Exception as e:
         logger.error(f"Avatar generation error: {e}")
@@ -687,6 +773,12 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
             case_sheet = payload.get("case_sheet")
             api_key = payload.get("groq_api_key") or os.environ.get("GROQ_API_KEY")
             degraded_reason = None
+            # The client only asks for video when it is in video mode AND a
+            # previous /health said the renderer is live.
+            want_video = bool(payload.get("want_video"))
+            video_live = want_video and (await musetalk.health()).get("live")
+            rendered_any = False
+            seq = 0
 
             await websocket.send_json({"type": "status", "status": "listening", "msg": "Processing prompt..."})
 
@@ -697,19 +789,56 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
             delimiters = set([".", "?", "!", ",", ";", "।", "\n"])
 
             async def process_and_send_chunk(phrase_text):
+                nonlocal rendered_any, seq
                 phrase_clean = phrase_text.strip()
                 if not phrase_clean:
                     return
+                my_seq = seq
+                seq += 1
                 try:
                     audio_path = await generate_edge_tts(phrase_clean, voice=voice)
-                    with open(audio_path, "rb") as f:
-                        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-                    
-                    await websocket.send_json({
+                    audio_bytes = audio_path.read_bytes()
+
+                    # True speech duration from the audio itself. The old
+                    # len(text)/12 guess was wrong in both directions and, for
+                    # short Bengali phrases, under-estimated badly enough that
+                    # the render timeout derived from it fired BEFORE a render
+                    # that was about to succeed -- the sidecar logged the
+                    # finished clip while the client had already given up and
+                    # opened its circuit breaker.
+                    phrase_seconds = edge_tts_duration_seconds(audio_bytes)
+
+                    if video_live:
+                        video = await musetalk.render(
+                            audio_path, phrase=phrase_clean, seq=my_seq, phrase_seconds=phrase_seconds
+                        )
+                        if video is not None:
+                            rendered_any = True
+                            # The mp4 carries its own audio track, so the client
+                            # must NOT also feed this phrase to the audio player.
+                            await websocket.send_json({
+                                "type": "av_chunk",
+                                "seq": my_seq,
+                                "phrase": phrase_clean,
+                                "video_url": _store_media(video, ".mp4"),
+                                "duration_ms": round(phrase_seconds * 1000),
+                                "has_audio": True,
+                            })
+                            return
+
+                    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                    frame = {
                         "type": "audio_chunk",
+                        "seq": my_seq,
                         "phrase": phrase_clean,
                         "audio_base64": f"data:audio/mp3;base64,{audio_b64}",
-                    })
+                    }
+                    if video_live:
+                        # Asked for video and did not get it — say so rather
+                        # than letting the client guess why the face went still.
+                        frame["video_failed"] = True
+                        frame["video_failed_reason"] = "render_failed"
+                    await websocket.send_json(frame)
                 except Exception as chunk_err:
                     logger.warning(f"Error processing audio chunk for '{phrase_clean}': {chunk_err}")
 
@@ -756,6 +885,7 @@ async def voice_call_streaming_endpoint(websocket: WebSocket):
                 "case_sheet": case_sheet,
                 "degraded": degraded_reason is not None,
                 "degraded_reason": degraded_reason,
+                "video_engine": "musetalk" if rendered_any else "fallback",
             })
 
     except WebSocketDisconnect:

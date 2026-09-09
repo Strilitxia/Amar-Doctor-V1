@@ -60,12 +60,23 @@ export default function ChatPage() {
   const [caseSheet, setCaseSheet] = useState(null);
   const [degradedReason, setDegradedReason] = useState(null);
 
+  // Video-call state. videoEngine is the honest answer to "what is actually
+  // drawing the doctor's face": "musetalk" only when the backend confirms a
+  // live lip-sync engine, "fallback" when the avatar is following the audio
+  // waveform, null when no backend is connected at all.
+  const [videoEngine, setVideoEngine] = useState(null);
+  const [lipsyncReason, setLipsyncReason] = useState(null);
+  const [selfViewStream, setSelfViewStream] = useState(null);
+  const [selfViewError, setSelfViewError] = useState(null);
+  const [micMuted, setMicMuted] = useState(false);
+  const [callSeconds, setCallSeconds] = useState(0);
+  const [isClipTalking, setIsClipTalking] = useState(false);
+
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
   const mediaStreamRef = useRef(null);   // Live mic MediaStream
   const whisperWsRef = useRef(null);     // Whisper WebSocket
   const vadRef = useRef(null);           // Active VAD segmenter handle
-  const audioPlayerRef = useRef(null);
   const streamPlayerRef = useRef(null);
   const voiceWsRef = useRef(null);
   const latestSpeechRef = useRef("");
@@ -80,6 +91,9 @@ export default function ChatPage() {
   const isVoiceCallActiveRef = useRef(false);
   const modeRef = useRef("text");
   const voiceLangRef = useRef("bn-BD");
+  const avatarRef = useRef(null);            // imperative handle on <VideoAvatar>
+  const selfViewStreamRef = useRef(null);    // patient's own camera (local preview only)
+  const videoEngineRef = useRef(null);
 
   // Conversation memory. These refs are written synchronously inside the
   // setMessages updater rather than from a useEffect: an effect-synced mirror
@@ -166,10 +180,18 @@ export default function ChatPage() {
         setColabConnected(true);
         setColabUrl(cleanUrl);
         localStorage.setItem("amar_doctor_colab_url", cleanUrl);
+        // The capability handshake. Never claim GPU lip-sync on anything
+        // weaker than the backend explicitly reporting a live engine.
+        const engine = data.lipsync?.live ? "musetalk" : "fallback";
+        setVideoEngine(engine);
+        videoEngineRef.current = engine;
+        setLipsyncReason(data.lipsync?.reason || null);
         return true;
       }
     } catch {
       setColabConnected(false);
+      setVideoEngine(null);
+      videoEngineRef.current = null;
     }
     return false;
   }, []);
@@ -188,6 +210,8 @@ export default function ChatPage() {
     streamPlayerRef.current.onPlayEnd = () => {
       setIsAvatarTalking(false);
       isProcessingRef.current = false;
+      // The per-message "Listen" button plays through this same queue.
+      setSpeakingMsgId(null);
       setCallStatusText("🎧 Listening to your voice... Speak now.");
     };
 
@@ -205,9 +229,23 @@ export default function ChatPage() {
       if (mediaStreamRef.current) {
         try { mediaStreamRef.current.getTracks().forEach((t) => t.stop()); } catch {}
       }
+      // A camera track left running keeps the hardware indicator lit long
+      // after the page is gone.
+      if (selfViewStreamRef.current) {
+        try { selfViewStreamRef.current.getTracks().forEach((t) => t.stop()); } catch {}
+      }
       if (streamPlayerRef.current) streamPlayerRef.current.stop();
     };
   }, []);
+
+  // Call duration timer — video mode shows it, like any call client.
+  // The counter is reset when a call starts, not here: resetting inside the
+  // effect would be a synchronous setState on every call teardown.
+  useEffect(() => {
+    if (!isVoiceCallActive) return;
+    const id = setInterval(() => setCallSeconds((s) => s + 1), 1000);
+    return () => clearInterval(id);
+  }, [isVoiceCallActive]);
 
   // Main interactive voice query handler — called the moment a full
   // utterance is detected (the VAD's onSpeechEnd), never from a
@@ -259,6 +297,10 @@ export default function ChatPage() {
               voice: selectedVoice,
               history: buildHistory(),
               case_sheet: caseSheetRef.current,
+              // Only ask for rendered video when we are in video mode AND the
+              // backend confirmed a live engine — otherwise every phrase would
+              // wait out a render timeout before falling back to audio.
+              want_video: modeRef.current === "video" && videoEngineRef.current === "musetalk",
             })
           );
         };
@@ -278,6 +320,16 @@ export default function ChatPage() {
               if (streamPlayerRef.current) {
                 streamPlayerRef.current.addChunk(payload.audio_base64);
               }
+            } else if (payload.type === "av_chunk" && payload.video_url) {
+              // A lip-synced clip. The mp4 carries its own audio, so it does
+              // NOT go through AudioStreamPlayer — two players cannot be kept
+              // in sync across Chrome's separate media clocks.
+              avatarRef.current?.enqueueClip({
+                url: sanitizeBackendUrl(colabUrl) + payload.video_url,
+                seq: payload.seq,
+                phrase: payload.phrase,
+                durationMs: payload.duration_ms,
+              });
             } else if (payload.type === "response_complete") {
               appendMessage({
                 id: `ai-${Date.now()}`,
@@ -355,6 +407,9 @@ export default function ChatPage() {
     if (!isAvatarTalkingRef.current && !isProcessingRef.current) return;
     activeTurnIdRef.current += 1;
     if (streamPlayerRef.current) streamPlayerRef.current.stop(); // -> onPlayEnd flips isAvatarTalking false
+    // In video mode the audio lives inside the mp4, so stopping the audio
+    // player alone leaves the doctor talking over the patient.
+    avatarRef.current?.flush();
     if (voiceWsRef.current) {
       try { voiceWsRef.current.close(); } catch {}
       voiceWsRef.current = null;
@@ -485,11 +540,48 @@ export default function ChatPage() {
     setCallStatusText(LISTENING_STATUS + (vad.engine === "energy" ? " (basic mode)" : ""));
   }, [colabUrl, interruptAiTurn]);
 
+  // ─── Patient self-view camera ───────────────────────────────────────
+  // Acquired as its own stream, separate from the mic. The mic stream is
+  // already bound into MicVAD (lib/vadSegmenter.js), and re-requesting it
+  // together with video would re-prompt and restart the recognizer.
+  // The feed is a LOCAL PREVIEW ONLY — it is never sent anywhere.
+  const acquireCamera = useCallback(async () => {
+    if (selfViewStreamRef.current) return selfViewStreamRef.current;
+    try {
+      const cam = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
+      });
+      selfViewStreamRef.current = cam;
+      setSelfViewStream(cam);
+      setSelfViewError(null);
+      return cam;
+    } catch (err) {
+      // A refused camera must never abort the consultation — the call keeps
+      // working, it just has no self-view.
+      console.warn("Camera unavailable, continuing without self-view:", err);
+      setSelfViewError(err?.name || "unavailable");
+      setSelfViewStream(null);
+      return null;
+    }
+  }, []);
+
+  const releaseCamera = useCallback(() => {
+    if (selfViewStreamRef.current) {
+      try { selfViewStreamRef.current.getTracks().forEach((t) => t.stop()); } catch {}
+      selfViewStreamRef.current = null;
+    }
+    setSelfViewStream(null);
+  }, []);
+
   const startVoiceCall = async () => {
     if (streamPlayerRef.current) streamPlayerRef.current.init();
+    // Consume the click that got us here: generated clips play unmuted, and
+    // without a used gesture the first play() is rejected silently.
+    avatarRef.current?.unlockAutoplay();
 
     setIsVoiceCallActive(true);
     isVoiceCallActiveRef.current = true;
+    setCallSeconds(0);
     setLiveTranscript("");
     latestSpeechRef.current = "";
     lastProcessedSpeechRef.current = { text: "", at: 0 };
@@ -515,6 +607,12 @@ export default function ChatPage() {
       return;
     }
     mediaStreamRef.current = stream;
+    setMicMuted(false);
+
+    if (modeRef.current === "video") {
+      await acquireCamera();
+    }
+
     setCallStatusText("🎤 Starting on-device recognition...");
     await startVadListening(stream, voiceLang === "en-US" ? "en" : "bn");
   };
@@ -548,6 +646,8 @@ export default function ChatPage() {
     }
 
     if (streamPlayerRef.current) streamPlayerRef.current.stop();
+    avatarRef.current?.flush();
+    releaseCamera();
     setIsAvatarTalking(false);
   };
 
@@ -653,16 +753,15 @@ export default function ChatPage() {
     startTextDictation();
   };
 
+  // All neural audio goes through the one AudioStreamPlayer, so it is routed
+  // through the analyser and the avatar's mouth follows it. A separate
+  // <audio> element here would play fine but leave the face motionless,
+  // which is exactly the "it doesn't feel like a doctor" failure.
+  // isAvatarTalking is set by the player's own onPlayStart/onPlayEnd.
   const playNeuralAudio = (audioBase64) => {
-    if (!audioPlayerRef.current) {
-      audioPlayerRef.current = new Audio();
-    }
-    const player = audioPlayerRef.current;
-    player.src = audioBase64;
-    player.onplay = () => setIsAvatarTalking(true);
-    player.onended = () => setIsAvatarTalking(false);
-    player.onerror = () => setIsAvatarTalking(false);
-    player.play().catch((e) => console.warn("Audio play error:", e));
+    if (!streamPlayerRef.current) return;
+    streamPlayerRef.current.init();
+    streamPlayerRef.current.addChunk(audioBase64);
   };
 
   const speakMessage = async (msgId, text) => {
@@ -888,13 +987,25 @@ export default function ChatPage() {
             </button>
             <button
               className={`chat-mode-btn ${mode === "audio" ? "active" : ""}`}
-              onClick={() => setMode("audio")}
+              onClick={() => {
+                // Switching between call modes must not tear down a live
+                // call — only the camera comes and goes.
+                setMode("audio");
+                modeRef.current = "audio";
+                releaseCamera();
+                avatarRef.current?.flush();
+              }}
             >
               🎙️ Voice Call
             </button>
             <button
               className={`chat-mode-btn ${mode === "video" ? "active" : ""}`}
-              onClick={() => setMode("video")}
+              onClick={() => {
+                setMode("video");
+                modeRef.current = "video";
+                avatarRef.current?.unlockAutoplay();
+                if (isVoiceCallActiveRef.current) acquireCamera();
+              }}
             >
               📹 Video Call
             </button>
@@ -935,17 +1046,52 @@ export default function ChatPage() {
             }}
           >
             <VideoAvatar
-              isTalking={isAvatarTalking}
-              colabConnected={colabConnected}
-              colabUrl={colabUrl}
+              ref={avatarRef}
+              isTalking={isAvatarTalking || isClipTalking}
+              engine={videoEngine}
               mode={mode}
+              playerRef={streamPlayerRef}
+              selfViewStream={selfViewStream}
+              selfViewError={selfViewError}
+              callActive={isVoiceCallActive}
+              onTalkingChange={setIsClipTalking}
             />
 
             <div style={{ maxWidth: 460, flex: 1 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                <span className="badge badge-cyan" style={{ fontSize: 11 }}>
-                  {mode === "video" ? "📹 MuseTalk Real-time Video" : "🎙️ Edge-TTS Streaming Voice"}
+                {/* Says what is actually rendering the face, not what we wish were. */}
+                <span
+                  className="badge"
+                  style={{
+                    fontSize: 11,
+                    background:
+                      mode === "video" && videoEngine !== "musetalk"
+                        ? "rgba(255, 176, 32, 0.15)"
+                        : "rgba(52, 237, 123, 0.18)",
+                    color: mode === "video" && videoEngine !== "musetalk" ? "#ffb020" : "#34ed7b",
+                  }}
+                  title={
+                    mode === "video" && videoEngine !== "musetalk"
+                      ? `GPU lip-sync unavailable${lipsyncReason ? ` (${lipsyncReason})` : ""} — the avatar is following the voice waveform instead.`
+                      : "Rendering engine confirmed live by the backend"
+                  }
+                >
+                  {mode === "video"
+                    ? videoEngine === "musetalk"
+                      ? "📹 MuseTalk Lip-Sync (local GPU)"
+                      : "📹 Audio-reactive avatar"
+                    : "🎙️ Edge-TTS Streaming Voice"}
                 </span>
+                {mode === "video" && isVoiceCallActive && (
+                  <span
+                    suppressHydrationWarning
+                    className="badge"
+                    style={{ background: "rgba(255,255,255,0.08)", color: "var(--color-bone-white)", fontSize: 10, fontVariantNumeric: "tabular-nums" }}
+                  >
+                    ⏱ {String(Math.floor(callSeconds / 60)).padStart(2, "0")}:
+                    {String(callSeconds % 60).padStart(2, "0")}
+                  </span>
+                )}
                 {isVoiceCallActive ? (
                   <span className="badge" style={{ background: "rgba(52, 237, 123, 0.2)", color: "#34ed7b", fontSize: 10 }}>
                     ● Call In Progress
@@ -996,7 +1142,54 @@ export default function ChatPage() {
                 >
                   {isVoiceCallActive ? "⏹️ End Call (কল শেষ করুন)" : "📞 Start Live Call (কথা বলুন)"}
                 </button>
+
+                {/* In-call controls — video mode only */}
+                {mode === "video" && isVoiceCallActive && (
+                  <>
+                    <button
+                      className="btn-ghost"
+                      style={{ padding: "10px 14px", fontSize: 13 }}
+                      title={selfViewStream ? "Turn camera off" : "Turn camera on"}
+                      id="camera-toggle-btn"
+                      onClick={() => {
+                        // Releasing the track (rather than just disabling it)
+                        // actually turns the camera indicator off.
+                        if (selfViewStream) {
+                          releaseCamera();
+                        } else {
+                          acquireCamera();
+                        }
+                      }}
+                    >
+                      {selfViewStream ? "📷 Camera on" : "🚫 Camera off"}
+                    </button>
+
+                    <button
+                      className="btn-ghost"
+                      style={{ padding: "10px 14px", fontSize: 13 }}
+                      title={micMuted ? "Unmute microphone" : "Mute microphone"}
+                      id="mic-mute-btn"
+                      onClick={() => {
+                        const next = !micMuted;
+                        setMicMuted(next);
+                        try {
+                          mediaStreamRef.current
+                            ?.getAudioTracks()
+                            .forEach((t) => { t.enabled = !next; });
+                        } catch {}
+                      }}
+                    >
+                      {micMuted ? "🔇 Muted" : "🎙️ Mic on"}
+                    </button>
+                  </>
+                )}
               </div>
+
+              {mode === "video" && (
+                <p className="text-caption text-muted" style={{ marginTop: 10, fontSize: 11 }}>
+                  Your camera is a local preview only — it is never uploaded or sent to the AI.
+                </p>
+              )}
             </div>
           </div>
         )}

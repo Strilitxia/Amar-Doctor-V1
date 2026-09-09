@@ -39,3 +39,13 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# doctor avatar assets — user-supplied, see backend/static/AVATAR.md
+/backend/static/doctor_avatar.png
+/backend/static/doctor_idle_source.mp4
+/backend/static/AVATAR_SOURCE.txt
+/public/doctor_idle.mp4
+/public/doctor_portrait.png
+
+# local service logs from start-all.ps1
+/.logs

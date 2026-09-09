@@ -7,7 +7,7 @@ This directory contains the AI Audio & Video consultation backend for **Amar Doc
 ## 🌟 What This Backend Does
 
 1. **Edge-TTS Bengali Voice Synthesis**: Uses Microsoft Azure Neural voices (`bn-BD-NabanitaNeural` / `bn-BD-PradeepNeural`) to speak fluent, empathetic Bengali at 0 cost.
-2. **AI Video Avatar (SadTalker / LivePortrait)**: Synchronizes facial movements and lips to generated audio frames on GPU.
+2. **AI Video Avatar (MuseTalk, optional)**: Lip-syncs a doctor portrait to the generated audio. Runs as a separate process because its dependencies cannot coexist with this backend's — see `MUSETALK_SETUP.md`. Without it the browser animates the avatar from the audio waveform instead.
 3. **Audio-Only Mode Bypass**: Instantly drops video rendering for deep rural areas to conserve bandwidth and GPU compute.
 4. **Cloudflare / Ngrok Tunneling**: Exposes a free, public HTTPS URL for the Next.js frontend without requiring a paid server.
 

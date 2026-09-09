@@ -1,7 +1,7 @@
 # 🩺 Amar Doctor V1 (আমার ডাক্তার)
 > **Resilient AI Telemedicine & Emergency Healthcare Platform for Rural Bangladesh**
 
-Amar Doctor V1 is a full-stack, offline-first digital healthcare system designed specifically for the unique infrastructure and language challenges of rural Bangladesh. It combines **conversational AI triage (Groq GPT-OSS-120B)**, **natural Bengali neural voice synthesis (Microsoft Edge-TTS)**, **GPU-accelerated lip-synced video avatars (MuseTalk / SadTalker)**, **self-hosted Bengali speech recognition (faster-whisper — no browser/cloud Web Speech API is used)**, **computer-vision prescription analysis (Gemini Vision)**, and **zero-bandwidth offline medical decision trees (IndexedDB + PWA)**.
+Amar Doctor V1 is a full-stack, offline-first digital healthcare system designed specifically for the unique infrastructure and language challenges of rural Bangladesh. It combines **conversational AI triage (Groq GPT-OSS-120B)**, **natural Bengali neural voice synthesis (Microsoft Edge-TTS)**, **lip-synced video avatars (optional MuseTalk on GPU, with an audio-reactive fallback)**, **self-hosted Bengali speech recognition (faster-whisper — no browser/cloud Web Speech API is used)**, **computer-vision prescription analysis (Gemini Vision)**, and **zero-bandwidth offline medical decision trees (IndexedDB + PWA)**.
 
 ---
 
@@ -53,7 +53,7 @@ graph TD
         UI --> M5[Leaflet / OpenStreetMap /map]
         
         M1 <--> ASP[AudioStreamPlayer & Mic Manager]
-        M1 <--> VA[VideoAvatar: Canvas 60FPS / MuseTalk]
+        M1 <--> VA[VideoAvatar: audio-reactive canvas / MuseTalk clip queue]
         M3 <--> IDB[(IndexedDB / Offline Medical DB)]
         M4 <--> BC[BroadcastChannel / LocalStorage Bus]
     end
@@ -70,15 +70,16 @@ graph TD
         M1 <==>|WebSocket /ws/transcribe| WS_STT[faster-whisper Bengali STT]
         M1 -.->|HTTP POST /api/transcribe| HTTP_STT[faster-whisper HTTP Fallback]
         M1 -.->|HTTP POST /api/chat-consultation| REST_Colab[Full Consultation Endpoint]
-        M1 -.->|LiveKit WebRTC| LK[LiveKit Cloud Video Room]
+        M1 -.->|HTTP GET /api/media/id.mp4| MEDIA[Generated clip delivery]
 
-        WS_STT --> WHISPER_MODEL["faster-whisper (small/base, GPU-aware)"]
+        WS_STT --> WHISPER_MODEL["faster-whisper large-v3 (GPU-aware)"]
         HTTP_STT --> WHISPER_MODEL
         
         WS_Voice --> GROQ_CORE[Groq GPT-OSS-120B Clinical Triage]
         GROQ_CORE --> CHUNKER[Punctuation Delimiter Chunking]
         CHUNKER --> EDGE_TTS[Microsoft Edge-TTS Streaming]
-        EDGE_TTS --> MT[MuseTalk / SadTalker Lip-Sync Video]
+        EDGE_TTS --> MT_SIDE[MuseTalk sidecar :8100 - separate py3.10 process]
+        MT_SIDE --> MEDIA
     end
 ```
 
@@ -92,7 +93,7 @@ graph TD
 ├────────────────────────────────────────────────────────────────────────────────────────┤
 │ • Speech Input  : MediaRecorder (Opus/WebM) ──► WebSocket /ws/transcribe               │
 │ • Speech Output : Queued Web Audio Buffer    ◄── WebSocket /ws/voice-call (Audio Chunks)│
-│ • Video Avatar  : Procedural 2D Canvas (60FPS) OR WebRTC / MuseTalk MP4 Stream        │
+│ • Video Avatar  : Audio-reactive canvas (60FPS) OR MuseTalk H.264 clip queue          │
 │ • Emergency Bus : BroadcastChannel + LocalStorage Event Fallback                       │
 │ • Offline Cache : ServiceWorker + IndexedDB Medical Conditions                         │
 └────────────────────────────────────────────────────────────────────────────────────────┘
@@ -106,7 +107,7 @@ graph TD
 │ 2. Clinical Reasoning  : Groq GPT-OSS-120B with rural health system prompt              │
 │ 3. TTS Synthesis       : Microsoft Edge-TTS (bn-BD-NabanitaNeural / PradeepNeural)     │
 │ 4. Streaming Chunking  : Punctuation triggers (। , . ? !) for instantaneous response   │
-│ 5. Avatar Synthesis    : MuseTalk / SadTalker neural lip synchronizer                  │
+│ 5. Avatar Synthesis    : MuseTalk lip-sync via out-of-process sidecar (optional)       │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -125,8 +126,9 @@ graph TD
   - Sub-sentences are immediately converted into natural Bengali audio waveforms using **Microsoft Edge-TTS** (`bn-BD-NabanitaNeural` / `bn-BD-PradeepNeural`).
   - Chunks are piped directly over the WebSocket to [AudioStreamPlayer.js](file:///Users/asif/project%20files/Amar%20Doctor%20V1/lib/audioStreamPlayer.js), playing back gaplessly while the rest of the response is still generating.
 - **Dual-Mode Video Avatar (`VideoAvatar.js`)**:
-  - **GPU Mode**: Deep-learning driven **MuseTalk** / **SadTalker** that generates lip-synced video frames matching the Bengali audio phonemes.
-  - **Offline/Lightweight Canvas Mode**: A 60 FPS HTML5 procedural doctor avatar complete with sinusoidal breathing, periodic eye-blinking, audio-reactive mouth movement, and neon spectral visualizer waves.
+  - **GPU Mode (optional)**: **MuseTalk** renders lip-synced H.264 clips from a real doctor portrait, delivered over the WebSocket as `av_chunk` frames and played through a double-buffered clip queue. It runs as a separate process — see [MUSETALK_SETUP.md](MUSETALK_SETUP.md). The UI shows the green "MuseTalk Lip-Sync" badge **only** when `/health` confirms the engine is live.
+  - **Fallback Mode (always available)**: A 60 FPS canvas doctor whose mouth is driven by the *real* audio envelope, read from an `AnalyserNode` on the playing TTS stream — it opens on vowels and is still during silence. Plus sinusoidal breathing, periodic blinking, and spectrum-driven visualizer bars.
+  - **Patient self-view**: video mode requests the webcam for a mirrored picture-in-picture preview. It is local only — never uploaded, never sent to the AI — and a denied camera never blocks the call.
 
 ---
 
@@ -191,7 +193,7 @@ graph TD
 | **LLM Clinical Core** | **Groq — GPT-OSS-120B** | Fast open-weight reasoning & symptom triage |
 | **Vision (Prescription OCR)** | **Google Gemini 3.6 Vision** | Multimodal prescription image analysis |
 | **TTS (Text-to-Speech)** | **Microsoft Edge-TTS (v7 streaming)** | Natural neural Bengali voice at 0 cost |
-| **Avatar Lip-Sync** | **MuseTalk / SadTalker** | Neural video frame generation on GPU |
+| **Avatar Lip-Sync** | **MuseTalk** (optional sidecar) | H.264 clips on GPU; audio-reactive canvas otherwise |
 | **Offline Storage** | **IndexedDB + PWA Service Worker** | 100% offline emergency first aid |
 | **Realtime Sync** | **WebSockets + BroadcastChannel API** | Live consultation & emergency dispatch |
 | **Mapping** | **Leaflet + OpenStreetMap** | Free, open hospital locating |
@@ -217,15 +219,17 @@ Amar Doctor V1/
 ├── backend/
 │   ├── amar_doctor_colab.ipynb      # 1-Click Google Colab Notebook (Free T4 GPU)
 │   ├── colab_runner.py              # Cloudflare/Ngrok launcher script
-│   ├── musetalk_agent.py            # MuseTalk lip-sync pipeline controller
+│   ├── musetalk_client.py           # HTTP client for the MuseTalk sidecar (timeout + breaker)
+│   ├── musetalk_stub.py             # Protocol stub — exercises the video path without MuseTalk
+│   ├── generate_idle_video.py       # Renders the H.264 idle loop from your portrait
 │   ├── server.py                    # FastAPI server (Edge-TTS, Whisper, WS endpoints)
 │   ├── requirements.txt             # Python backend dependencies
-│   └── static/                      # Static doctor avatar portraits
+│   └── static/AVATAR.md             # Doctor portrait drop-in contract (asset not shipped)
 ├── components/
 │   ├── Navbar.js                    # Responsive header with live Colab status
 │   ├── Footer.js                    # Medical disclaimer & regional helpline links
 │   ├── SOSButton.js                 # Global floating emergency panic button
-│   ├── VideoAvatar.js               # Canvas 60FPS / MuseTalk dynamic video player
+│   ├── VideoAvatar.js               # Clip queue + audio-reactive canvas + self-view PiP
 │   └── OpenStreetMapView.js         # Interactive Leaflet map component
 ├── lib/
 │   ├── audioStreamPlayer.js         # Gapless audio queue player for TTS chunks
@@ -271,7 +275,8 @@ Amar Doctor V1/
 
 ### Backend AI Sandbox (FastAPI / Colab)
 
-The backend provides **Whisper STT**, **Edge-TTS Bengali voice**, and **MuseTalk video generation**.
+The backend provides **Whisper STT**, **Edge-TTS Bengali voice**, and clip delivery for the
+optional **MuseTalk** lip-sync sidecar (see [MUSETALK_SETUP.md](MUSETALK_SETUP.md)).
 
 #### Option A: Run on Google Colab (Recommended — Free T4 GPU)
 1. Open [Google Colab](https://colab.research.google.com/).
@@ -303,9 +308,8 @@ API documentation will be accessible at [http://localhost:8000/docs](http://loca
 |---|---|---|
 | `GROQ_API_KEY` | Next.js (`.env.local`) & Colab | Groq API key for clinical chat triage (GPT-OSS-120B). |
 | `GEMINI_API_KEY` | Next.js (`.env.local`) | Google Gemini API key for prescription image analysis (Vision OCR only — GPT-OSS-120B has no vision support). |
-| `LIVEKIT_URL` | Colab / Backend (Optional) | LiveKit WebRTC server URL for cloud video streaming. |
-| `LIVEKIT_API_KEY` | Colab / Backend (Optional) | LiveKit cloud API authentication key. |
-| `LIVEKIT_API_SECRET` | Colab / Backend (Optional) | LiveKit cloud API secret. |
+| `MUSETALK_SIDECAR_URL` | Backend (Optional) | URL of the MuseTalk renderer, e.g. `http://127.0.0.1:8100`. Unset = GPU lip-sync off; the avatar falls back to following the audio waveform. |
+| `WHISPER_MODEL_SIZE` | Backend (Optional) | Defaults to `large-v3`. Bengali accuracy collapses below `small` — see `backend/README.md`. |
 
 ---
 

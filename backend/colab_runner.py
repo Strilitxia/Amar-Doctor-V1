@@ -8,15 +8,20 @@ import os
 import sys
 import subprocess
 import time
+from pathlib import Path
+
 import requests
 
 def install_dependencies():
-    print("📦 [1/4] Installing dependencies (edge-tts, faster-whisper, fastapi, uvicorn)...")
-    subprocess.run([
-        sys.executable, "-m", "pip", "install", "-q",
-        "fastapi", "uvicorn[standard]", "edge-tts>=7.2.8", "pydantic",
-        "python-multipart", "pyngrok", "requests", "faster-whisper>=1.0.0"
-    ], check=True)
+    print("📦 [1/4] Installing dependencies from backend/requirements.txt...")
+    # Install from requirements.txt rather than a hand-written list. The old
+    # list had drifted and was silently missing python-dotenv (so the Groq key
+    # never loaded), httpx, torch, scipy, soundfile and imageio-ffmpeg.
+    req = Path(__file__).resolve().parent / "requirements.txt"
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "-r", str(req)],
+        check=True,
+    )
     print("✓ Core dependencies installed successfully.")
 
 def download_cloudflared():
@@ -32,6 +37,11 @@ def start_backend_and_tunnel(ngrok_token=None):
     # Ensure working directory has backend package accessible
     env = os.environ.copy()
     env["PYTHONPATH"] = os.getcwd()
+    # Optional GPU lip-sync. Unset means the video call uses the browser's
+    # audio-reactive avatar — see MUSETALK_SETUP.md.
+    if os.environ.get("MUSETALK_SIDECAR_URL"):
+        env["MUSETALK_SIDECAR_URL"] = os.environ["MUSETALK_SIDECAR_URL"]
+        print(f"   MuseTalk sidecar: {env['MUSETALK_SIDECAR_URL']}")
 
     server_process = subprocess.Popen([
         sys.executable, "-m", "uvicorn", "backend.server:app", "--host", "0.0.0.0", "--port", "8000"
