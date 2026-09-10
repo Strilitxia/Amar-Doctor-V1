@@ -49,3 +49,6 @@ next-env.d.ts
 
 # local service logs from start-all.ps1
 /.logs
+
+# medical camp store written at runtime by app/api/camps/route.js
+/data/medical-camps.json

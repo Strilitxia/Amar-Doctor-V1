@@ -10,8 +10,9 @@ export default function Footer() {
         <div className="footer__links">
           <Link href="/chat" className="footer__link">AI Doctor</Link>
           <Link href="/symptoms" className="footer__link">Offline Care</Link>
-          <Link href="/symptoms/finder" className="footer__link">⚡ Fast Symptom Finder</Link>
-          <Link href="/map" className="footer__link">Find Hospital</Link>
+          <Link href="/symptoms/finder" className="footer__link">⚡ Symptom Checker</Link>
+          <Link href="/map" className="footer__link">Medical Camps</Link>
+          <Link href="/camps/new" className="footer__link">Post a Camp</Link>
           <Link href="/prescription" className="footer__link">Prescription</Link>
         </div>
       </div>

@@ -8,8 +8,8 @@ const NAV_LINKS = [
   { href: "/", label: "Home", labelBn: "হোম" },
   { href: "/chat", label: "AI Doctor", labelBn: "এআই ডাক্তার" },
   { href: "/symptoms", label: "Offline Care", labelBn: "অফলাইন চিকিৎসা" },
-  { href: "/symptoms/finder", label: "⚡ Symptom Finder", labelBn: "⚡ লক্ষণ নিরূপণ" },
-  { href: "/map", label: "Find Hospital", labelBn: "হাসপাতাল" },
+  { href: "/symptoms/finder", label: "⚡ Symptom Checker", labelBn: "⚡ লক্ষণ পরীক্ষা" },
+  { href: "/map", label: "Medical Camps", labelBn: "মেডিকেল ক্যাম্প" },
   { href: "/prescription", label: "Prescription", labelBn: "প্রেসক্রিপশন" },
   { href: "/emergency", label: "SOS Command", labelBn: "জরুরি কন্ট্রোল" },
 ];

@@ -22,11 +22,11 @@ const FEATURES = [
   },
   {
     icon: "⚡",
-    title: "Fast Symptom Finder (Triage)",
-    titleBn: "ধাপভিত্তিক লক্ষণ নিরূপণ উইজার্ড",
-    desc: "Step-by-step 5-stage guided triage decision tree with immediate RED/YELLOW/GREEN emergency assessment and Bengali audio solutions.",
+    title: "Symptom Checker (Triage)",
+    titleBn: "লক্ষণ থেকে রোগ নিরূপণ",
+    desc: "Tap the symptoms you feel and get a ranked shortlist of likely conditions with RED/YELLOW/GREEN urgency, first aid steps and Bengali audio — fully offline.",
     href: "/symptoms/finder",
-    linkText: "Open Fast Finder",
+    linkText: "Open Symptom Checker",
   },
   {
     icon: "💊",
@@ -37,12 +37,12 @@ const FEATURES = [
     linkText: "Scan Prescription",
   },
   {
-    icon: "🗺️",
-    title: "Doctor & Hospital Map",
-    titleBn: "ডাক্তার ও হাসপাতাল ম্যাপ",
-    desc: "Find nearest upazila health complexes, government clinics, and private hospitals with GPS routing, ratings, and phone contacts across Bangladesh.",
+    icon: "⛑️",
+    title: "NGO Medical Camp Finder",
+    titleBn: "এনজিও মেডিকেল ক্যাম্প ম্যাপ",
+    desc: "See ongoing and upcoming free NGO medical camps on a live map — date, time, venue and specialist type (eye, heart, dental, maternal care) — plus permanent hospitals as a second layer. Organizers can announce a camp in minutes.",
     href: "/map",
-    linkText: "Find Nearby",
+    linkText: "Find a Camp Nearby",
   },
   {
     icon: "🚨",
@@ -122,7 +122,7 @@ export default function Home() {
               🩺 Start Consultation (পরামর্শ নিন)
             </Link>
             <Link href="/symptoms/finder" className="btn-primary" style={{ background: "rgba(106, 228, 255, 0.2)", border: "1px solid var(--color-spectral-cyan)" }} id="hero-cta-finder">
-              ⚡ Fast Symptom Finder (লক্ষণ নিরূপণ)
+              ⚡ Symptom Checker (লক্ষণ থেকে রোগ চিনুন)
             </Link>
             <Link href="/symptoms" className="btn-ghost" id="hero-cta-offline">
               📶 Offline First-Aid <span className="arrow">→</span>

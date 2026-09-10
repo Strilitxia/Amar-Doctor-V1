@@ -100,16 +100,16 @@ export default function SymptomsPage() {
             </div>
 
             <h1 className="text-heading-lg" style={{ marginBottom: 12 }}>
-              Offline <span className="text-cyan">Symptom Checker</span> & First-Aid
+              Offline <span className="text-cyan">First-Aid Library</span> & Symptom Guide
             </h1>
             <p className="text-body text-muted" style={{ maxWidth: 640, margin: "0 auto", marginBottom: 20 }}>
               জরুরি প্রাথমিক চিকিৎসা ও লক্ষণ নির্দেশিকা — Complete emergency protocols cached on your device. Works seamlessly in remote villages with zero internet.
             </p>
 
-            {/* Offline Fast Symptom Finder Callout Banner */}
+            {/* Offline Symptom Checker Callout Banner */}
             <div style={{ display: "inline-block" }}>
               <Link href="/symptoms/finder" className="btn-primary" style={{ padding: "12px 28px", fontSize: 15, textDecoration: "none" }}>
-                ⚡ Open Fast Symptom Finder (ধাপভিত্তিক লক্ষণ নিরূপণ) →
+                ❓ লক্ষণ জানেন কিন্তু রোগ জানেন না? → Symptom Checker চেষ্টা করুন
               </Link>
             </div>
           </div>
