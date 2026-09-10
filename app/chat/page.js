@@ -22,6 +22,37 @@ const INITIAL_MESSAGES = [
 const HISTORY_WINDOW = 20;
 const SESSION_KEY = "amar_doctor_session";
 
+// Speech-to-text engines the call can use. The privacy difference between
+// them is real and is stated in the UI rather than buried: Whisper keeps the
+// patient's audio inside this project's own backend, Web Speech uploads it
+// to Google. See lib/webSpeechRecognizer.js.
+const STT_ENGINE_META = {
+  whisper: {
+    short: "🖥️ Whisper",
+    label: "Whisper (self-hosted)",
+    badge: "🖥️ Whisper — audio stays on your backend",
+    color: "var(--color-spectral-cyan)",
+    border: "rgba(106, 228, 255, 0.5)",
+    hint: "Self-hosted faster-whisper. Audio never leaves your backend. Click to try Google Web Speech.",
+  },
+  webspeech: {
+    short: "☁️ Web Speech",
+    label: "Google Web Speech",
+    badge: "☁️ Google Web Speech — audio sent to Google",
+    color: "#ffb020",
+    border: "rgba(255, 176, 32, 0.6)",
+    hint: "Chrome's Web Speech API. Sends audio to Google and needs internet. Click to run BOTH side by side.",
+  },
+  both: {
+    short: "⚖️ A/B",
+    label: "Both (compare)",
+    badge: "⚖️ Whisper + Web Speech side by side",
+    color: "#c084fc",
+    border: "rgba(192, 132, 252, 0.6)",
+    hint: "Both engines on the same audio. Whisper drives the consultation; Web Speech is shown for comparison. Click to go back to Whisper only.",
+  },
+};
+
 // Robust URL Sanitizer & WebSocket URL Generator
 const sanitizeBackendUrl = (url) => {
   if (!url) return "http://localhost:8000";
@@ -73,6 +104,18 @@ export default function ChatPage() {
   const [callSeconds, setCallSeconds] = useState(0);
   const [isClipTalking, setIsClipTalking] = useState(false);
 
+  // ─── Speech-to-text engine (A/B testing) ────────────────────────────
+  // "whisper"   — self-hosted faster-whisper. Audio never leaves our backend.
+  // "webspeech" — Chrome's Web Speech API. Audio goes to GOOGLE's servers,
+  //               and it needs a live internet connection.
+  // "both"      — Whisper still drives the consultation; Web Speech runs
+  //               alongside purely so the two can be compared on the exact
+  //               same utterance. This is the one that actually answers
+  //               "which is better at Bangla?".
+  const [sttEngine, setSttEngine] = useState("whisper");
+  const [webSpeechTranscript, setWebSpeechTranscript] = useState("");
+  const [webSpeechError, setWebSpeechError] = useState(null);
+
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
   const mediaStreamRef = useRef(null);   // Live mic MediaStream
@@ -95,6 +138,8 @@ export default function ChatPage() {
   const avatarRef = useRef(null);            // imperative handle on <VideoAvatar>
   const selfViewStreamRef = useRef(null);    // patient's own camera (local preview only)
   const videoEngineRef = useRef(null);
+  const webSpeechRef = useRef(null);         // active Web Speech recognizer handle
+  const sttEngineRef = useRef("whisper");    // read from async callbacks, never stale
 
   // Conversation memory. These refs are written synchronously inside the
   // setMessages updater rather than from a useEffect: an effect-synced mirror
@@ -145,6 +190,15 @@ export default function ChatPage() {
         caseSheetRef.current = saved.caseSheet || null;
         setCaseSheet(saved.caseSheet || null);
       }
+      // Same reasoning as above — read in the effect, not a useState
+      // initializer, so the first paint still matches the server HTML.
+      // Comparing two speech engines means a lot of reloads; re-picking the
+      // engine on each one would be pure friction.
+      const savedEngine = localStorage.getItem("amar_doctor_stt_engine");
+      if (savedEngine === "whisper" || savedEngine === "webspeech" || savedEngine === "both") {
+        setSttEngine(savedEngine);
+        sttEngineRef.current = savedEngine;
+      }
     } catch (e) {
       console.warn("Could not restore session:", e);
     }
@@ -171,6 +225,7 @@ export default function ChatPage() {
   useEffect(() => { isVoiceCallActiveRef.current = isVoiceCallActive; }, [isVoiceCallActive]);
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { voiceLangRef.current = voiceLang; }, [voiceLang]);
+  useEffect(() => { sttEngineRef.current = sttEngine; }, [sttEngine]);
 
   const checkColabConnection = useCallback(async (url) => {
     try {
@@ -227,6 +282,9 @@ export default function ChatPage() {
       if (voiceWsRef.current) voiceWsRef.current.close();
       if (whisperWsRef.current) whisperWsRef.current.close();
       if (vadRef.current) { try { vadRef.current.destroy(); } catch {} }
+      // Without this the recognizer keeps its own mic capture open and keeps
+      // auto-restarting itself after the page is gone.
+      if (webSpeechRef.current) { try { webSpeechRef.current.destroy(); } catch {} }
       if (mediaStreamRef.current) {
         try { mediaStreamRef.current.getTracks().forEach((t) => t.stop()); } catch {}
       }
@@ -541,6 +599,93 @@ export default function ChatPage() {
     setCallStatusText(LISTENING_STATUS + (vad.engine === "energy" ? " (basic mode)" : ""));
   }, [colabUrl, interruptAiTurn]);
 
+  // ─── Chrome Web Speech API (the A/B alternative to Whisper) ──────────
+  // Unlike the Whisper path there is no VAD and no audio upload of our own:
+  // Chrome captures the mic itself, does its own endpointing, and streams
+  // the audio to Google. We only consume the events.
+  //
+  // `drivesConversation` is what separates the two modes that use this:
+  // in "webspeech" it feeds the AI turn, in "both" it is display-only so
+  // Whisper stays in charge of the actual consultation.
+  const startWebSpeech = useCallback(
+    async (langTag, { drivesConversation }) => {
+      const { createWebSpeechRecognizer, isWebSpeechSupported } = await import(
+        "@/lib/webSpeechRecognizer"
+      );
+
+      if (!isWebSpeechSupported()) {
+        setWebSpeechError("unsupported");
+        if (drivesConversation) {
+          setCallStatusText("⚠️ Web Speech needs Chrome or Edge — switch to Whisper.");
+        }
+        return null;
+      }
+
+      if (webSpeechRef.current) {
+        try { webSpeechRef.current.destroy(); } catch {}
+        webSpeechRef.current = null;
+      }
+
+      setWebSpeechError(null);
+      setWebSpeechTranscript("");
+
+      try {
+        const recognizer = createWebSpeechRecognizer({
+          lang: langTag,
+          onSpeechStart: () => {
+            // Only the engine actually running the call gets to cut the AI
+            // off; in "both" mode Whisper's own VAD owns barge-in, and two
+            // engines racing to interrupt would double-fire it.
+            if (!drivesConversation) return;
+            setLiveTranscript("");
+            interruptAiTurn();
+          },
+          onInterim: (text) => {
+            setWebSpeechTranscript(text);
+            if (drivesConversation) setLiveTranscript(text);
+          },
+          onFinal: (text) => {
+            setWebSpeechTranscript(text);
+            if (!drivesConversation) return;
+            setLiveTranscript(text);
+            latestSpeechRef.current = text;
+            handleTurnRef.current?.(text);
+          },
+          onError: (err) => {
+            console.warn("Web Speech:", err);
+            setWebSpeechError(err?.reason || "error");
+            // `network` is the one worth calling out: Chrome's recognizer is
+            // a cloud service, so it simply stops working offline — which is
+            // exactly the situation this app is otherwise built to survive.
+            if (drivesConversation && err?.reason === "network") {
+              setCallStatusText("⚠️ Web Speech is offline (needs internet) — switch to Whisper.");
+            }
+          },
+        });
+
+        webSpeechRef.current = recognizer;
+        if (drivesConversation) {
+          setIsListening(true);
+          setCallStatusText(`🎤 Listening via Google Web Speech (${langTag})...`);
+        }
+        return recognizer;
+      } catch (err) {
+        console.warn("Web Speech init failed:", err);
+        setWebSpeechError("init_failed");
+        return null;
+      }
+    },
+    [interruptAiTurn]
+  );
+
+  const stopWebSpeech = useCallback(() => {
+    if (webSpeechRef.current) {
+      try { webSpeechRef.current.destroy(); } catch {}
+      webSpeechRef.current = null;
+    }
+    setWebSpeechTranscript("");
+  }, []);
+
   // ─── Patient self-view camera ───────────────────────────────────────
   // Acquired as its own stream, separate from the mic. The mic stream is
   // already bound into MicVAD (lib/vadSegmenter.js), and re-requesting it
@@ -614,8 +759,18 @@ export default function ChatPage() {
       await acquireCamera();
     }
 
-    setCallStatusText("🎤 Starting on-device recognition...");
-    await startVadListening(stream, voiceLang === "en-US" ? "en" : "bn");
+    const engine = sttEngineRef.current;
+    const langTag = voiceLang === "en-US" ? "en-US" : "bn-BD";
+
+    // Whisper drives the call in "whisper" and "both"; Web Speech drives it
+    // only when it is the sole engine.
+    if (engine === "whisper" || engine === "both") {
+      setCallStatusText("🎤 Starting on-device recognition...");
+      await startVadListening(stream, voiceLang === "en-US" ? "en" : "bn");
+    }
+    if (engine === "webspeech" || engine === "both") {
+      await startWebSpeech(langTag, { drivesConversation: engine === "webspeech" });
+    }
   };
 
   const stopVoiceCall = () => {
@@ -633,6 +788,7 @@ export default function ChatPage() {
       try { vadRef.current.destroy(); } catch {}
       vadRef.current = null;
     }
+    stopWebSpeech();
     if (mediaStreamRef.current) {
       try { mediaStreamRef.current.getTracks().forEach((t) => t.stop()); } catch {}
       mediaStreamRef.current = null;
@@ -1103,8 +1259,17 @@ export default function ChatPage() {
                   </span>
                 )}
                 {isVoiceCallActive && (
-                  <span className="badge" style={{ background: "rgba(106, 228, 255, 0.15)", color: "var(--color-spectral-cyan)", fontSize: 10 }}>
-                    🖥️ On-device Whisper Recognition
+                  <span
+                    className="badge"
+                    style={{
+                      background: "rgba(255, 255, 255, 0.06)",
+                      color: STT_ENGINE_META[sttEngine].color,
+                      fontSize: 10,
+                      border: `1px solid ${STT_ENGINE_META[sttEngine].border}`,
+                    }}
+                    title={STT_ENGINE_META[sttEngine].hint}
+                  >
+                    {STT_ENGINE_META[sttEngine].badge}
                   </span>
                 )}
               </div>
@@ -1129,8 +1294,39 @@ export default function ChatPage() {
                     color: "var(--color-bone-white)",
                   }}
                 >
-                  <span style={{ color: "var(--color-spectral-cyan)", fontWeight: 700 }}>🗣️ You: </span>
+                  <span style={{ color: "var(--color-spectral-cyan)", fontWeight: 700 }}>
+                    🗣️ You{sttEngine === "both" ? " (Whisper)" : ""}:{" "}
+                  </span>
                   {liveTranscript}
+                </div>
+              )}
+
+              {/* A/B strip: what Google heard for the same utterance. Only in
+                  "both" mode — in "webspeech" mode its text already IS the
+                  live transcript above, so showing it twice is just noise. */}
+              {sttEngine === "both" && isVoiceCallActive && (
+                <div
+                  style={{
+                    background: "rgba(192, 132, 252, 0.08)",
+                    border: "1px solid rgba(192, 132, 252, 0.3)",
+                    borderRadius: "var(--radius-cards)",
+                    padding: "10px 14px",
+                    marginBottom: 16,
+                    fontSize: 13,
+                    color: "var(--color-bone-white)",
+                  }}
+                  id="webspeech-compare-strip"
+                >
+                  <span style={{ color: "#c084fc", fontWeight: 700 }}>☁️ Google heard: </span>
+                  {webSpeechError
+                    ? <span style={{ color: "#ffb020" }}>
+                        {webSpeechError === "unsupported"
+                          ? "not supported in this browser (Chrome/Edge only)"
+                          : webSpeechError === "network"
+                          ? "offline — Web Speech needs internet"
+                          : `error: ${webSpeechError}`}
+                      </span>
+                    : webSpeechTranscript || <span className="text-muted">listening…</span>}
                 </div>
               )}
 
@@ -1177,6 +1373,14 @@ export default function ChatPage() {
                           mediaStreamRef.current
                             ?.getAudioTracks()
                             .forEach((t) => { t.enabled = !next; });
+                        } catch {}
+                        // Web Speech captures the mic itself, so disabling
+                        // OUR track above does nothing to it — a "muted" call
+                        // would carry on being transcribed to Google. Pause
+                        // the recognizer explicitly.
+                        try {
+                          if (next) webSpeechRef.current?.pause();
+                          else webSpeechRef.current?.resume();
                         } catch {}
                       }}
                     >
@@ -1270,6 +1474,36 @@ export default function ChatPage() {
             title="Switch Speech Language"
           >
             {voiceLang === "bn-BD" ? "বাংলা" : "ENG"}
+          </button>
+
+          {/* STT engine A/B toggle. Cycles Whisper -> Web Speech -> Both. */}
+          <button
+            className="btn-ghost"
+            style={{
+              padding: "6px 10px",
+              fontSize: 11,
+              borderRadius: "var(--radius-badges)",
+              borderColor: STT_ENGINE_META[sttEngine].border,
+              color: STT_ENGINE_META[sttEngine].color,
+            }}
+            onClick={() => {
+              const order = ["whisper", "webspeech", "both"];
+              const next = order[(order.indexOf(sttEngine) + 1) % order.length];
+              setSttEngine(next);
+              sttEngineRef.current = next;
+              try { localStorage.setItem("amar_doctor_stt_engine", next); } catch {}
+              // Switching engines mid-call would leave the old one running,
+              // so make the change take effect on the next call instead of
+              // half-applying it now.
+              if (isVoiceCallActiveRef.current) {
+                stopVoiceCall();
+                setCallStatusText(`Speech engine → ${STT_ENGINE_META[next].label}. Press call to restart.`);
+              }
+            }}
+            title={STT_ENGINE_META[sttEngine].hint}
+            id="stt-engine-toggle"
+          >
+            {STT_ENGINE_META[sttEngine].short}
           </button>
 
           <button

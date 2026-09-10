@@ -48,12 +48,20 @@ Server will be live on `http://localhost:8000`. Test docs at `http://localhost:8
 
 ---
 
-## 🗣️ Speech-to-Text: self-hosted Whisper only
+## 🗣️ Speech-to-Text: self-hosted Whisper by default
 
-All speech-to-text — both the live voice call and text-mode mic dictation
-— goes exclusively through this server's own `faster-whisper` model. The
-browser's native Web Speech API is intentionally never used, so voice audio
-never leaves this backend to a third-party cloud recognizer.
+Speech-to-text defaults to this server's own `faster-whisper` model, so
+voice audio never leaves this backend to a third-party cloud recognizer.
+That is the shipping default for both the live voice call and text-mode mic
+dictation.
+
+There is one deliberate, opt-in exception: `/chat` has a speech-engine toggle
+that can switch the live call to Chrome's Web Speech API, or run both at once
+to compare them on the same utterance. It exists to measure Bengali accuracy
+against a cloud recognizer. **Web Speech uploads the patient's audio to
+Google and needs an internet connection**, so the UI labels it as such
+whenever it is active rather than swapping engines silently. It resets to
+nothing on a fresh browser and has to be chosen explicitly.
 
 Model size defaults to accuracy over raw speed, and is deliberately **not**
 scaled down on CPU. Model size is the dominant factor for Bengali quality:

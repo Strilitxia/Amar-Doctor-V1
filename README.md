@@ -1,7 +1,7 @@
 # 🩺 Amar Doctor V1 (আমার ডাক্তার)
 > **Resilient AI Telemedicine & Emergency Healthcare Platform for Rural Bangladesh**
 
-Amar Doctor V1 is a full-stack, offline-first digital healthcare system designed specifically for the unique infrastructure and language challenges of rural Bangladesh. It combines **conversational AI triage (Groq GPT-OSS-120B)**, **natural Bengali neural voice synthesis (Microsoft Edge-TTS)**, **lip-synced video avatars (optional MuseTalk on GPU, with an audio-reactive fallback)**, **self-hosted Bengali speech recognition (faster-whisper — no browser/cloud Web Speech API is used)**, **computer-vision prescription analysis (Gemini Vision)**, and **zero-bandwidth offline medical decision trees (IndexedDB + PWA)**.
+Amar Doctor V1 is a full-stack, offline-first digital healthcare system designed specifically for the unique infrastructure and language challenges of rural Bangladesh. It combines **conversational AI triage (Groq GPT-OSS-120B)**, **natural Bengali neural voice synthesis (Microsoft Edge-TTS)**, **lip-synced video avatars (optional MuseTalk on GPU, with an audio-reactive fallback)**, **self-hosted Bengali speech recognition (faster-whisper by default; an opt-in toggle can A/B it against Chrome's cloud Web Speech API)**, **computer-vision prescription analysis (Gemini Vision)**, and **zero-bandwidth offline medical decision trees (IndexedDB + PWA)**.
 
 ---
 
@@ -103,7 +103,7 @@ graph TD
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                        FASTAPI BACKEND AI ENGINE (server.py)                           │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
-│ 1. STT Engine          : faster-whisper (self-hosted only; no browser Web Speech API)  │
+│ 1. STT Engine          : faster-whisper (self-hosted default; opt-in Web Speech A/B)   │
 │ 2. Clinical Reasoning  : Groq GPT-OSS-120B with rural health system prompt              │
 │ 3. TTS Synthesis       : Microsoft Edge-TTS (bn-BD-NabanitaNeural / PradeepNeural)     │
 │ 4. Streaming Chunking  : Punctuation triggers (। , . ? !) for instantaneous response   │
@@ -116,7 +116,7 @@ graph TD
 ## 🚀 Feature Breakdown
 
 ### 1. AI Doctor Voice & Video Consultation (`/chat`)
-- **Speech-to-Text (Bengali & English) — self-hosted only, no browser Web Speech API**:
+- **Speech-to-Text (Bengali & English) — self-hosted by default**:
   - A real Voice-Activity-Detection model (Silero VAD via `@ricky0123/vad-web`, running on-device in WASM) segments the microphone stream into genuine utterances — no fixed-length slicing, and no audio sent anywhere until real speech is detected.
   - Each utterance is sent as a clean WAV over WebSocket `/ws/transcribe` to a local or Colab `faster-whisper` model (HTTP POST `/api/transcribe` as automatic fallback if WebSockets are blocked by proxies).
   - **Turn detection**: driven by the VAD's own speech-end signal, not a client-guessed timer — a turn submits the moment the patient actually stops talking.
@@ -189,7 +189,7 @@ graph TD
 |---|---|---|
 | **Frontend Framework** | **Next.js 16 (App Router) + React 19** | Modern server/client architecture |
 | **Styling & Design System** | **Tailwind CSS + Custom Modern Tokens** | High-contrast dark medical aesthetics |
-| **STT (Speech-to-Text)** | **faster-whisper (self-hosted, GPU-aware)** | On-device Bengali/English transcription — no browser Web Speech API |
+| **STT (Speech-to-Text)** | **faster-whisper (self-hosted, GPU-aware)** | On-device Bengali/English transcription. An opt-in `/chat` toggle can compare it against Chrome's Web Speech API (which uploads audio to Google). |
 | **LLM Clinical Core** | **Groq — GPT-OSS-120B** | Fast open-weight reasoning & symptom triage |
 | **Vision (Prescription OCR)** | **Google Gemini 3.6 Vision** | Multimodal prescription image analysis |
 | **TTS (Text-to-Speech)** | **Microsoft Edge-TTS (v7 streaming)** | Natural neural Bengali voice at 0 cost |

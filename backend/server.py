@@ -35,9 +35,11 @@ except ImportError:  # pragma: no cover - depends on how uvicorn was launched
 # keyless and answered every consultation with a canned string.
 load_dotenv(Path(__file__).resolve().parent.parent / ".env.local")
 
-# Lazy-loaded Whisper model — the ONLY speech-to-text engine used by this
-# app (no browser Web Speech API is used anywhere, so audio never leaves
-# this backend). Model size/device/compute-type are env-configurable.
+# Lazy-loaded Whisper model — the DEFAULT speech-to-text engine, and the
+# only one that keeps audio inside this backend. (The /chat page has an
+# opt-in toggle that can route the live call to Chrome's Web Speech API
+# instead, for Bengali accuracy comparison; that path never reaches this
+# server at all.) Model size/device/compute-type are env-configurable.
 #
 # Model size is THE dominant factor for Bengali quality. Whisper saw orders
 # of magnitude less Bengali than English in training, so the small
