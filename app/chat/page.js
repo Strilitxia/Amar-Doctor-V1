@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import Navbar from "@/components/Navbar";
 import SOSButton from "@/components/SOSButton";
 import VideoAvatar from "@/components/VideoAvatar";
+import DroneDeliveryCTA from "@/components/DroneDeliveryCTA";
 import { AudioStreamPlayer } from "@/lib/audioStreamPlayer";
 
 const INITIAL_MESSAGES = [
@@ -1250,6 +1251,12 @@ export default function ChatPage() {
               </div>
             </div>
           )}
+
+          {/* Offer a drone delivery once the AI has stopped gathering and formed
+              an assessment. DroneDeliveryCTA derives the kit offline from this
+              same case sheet and returns null on a red flag, so a chest-pain
+              consultation gets the emergency path instead of a medicine button. */}
+          <DroneDeliveryCTA source="ai_chat" caseSheet={caseSheet} />
 
           <div ref={messagesEndRef} />
         </div>

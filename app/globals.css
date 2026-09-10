@@ -1594,6 +1594,15 @@ ul, ol {
 }
 
 
+/* The navbar is position:fixed, so any page rendering directly under it (no
+   Navbar-aware wrapper) must reserve --navbar-height itself, same as
+   .prescription-page and .drn-page below, or its header renders underneath the
+   nav links. */
+.symptoms-finder-page {
+  padding-top: calc(var(--navbar-height) + var(--spacing-24));
+  min-height: 100vh;
+}
+
 /* --------------------------------------------------------------------------
    16. Component: Prescription Scanner
    -------------------------------------------------------------------------- */
@@ -2062,6 +2071,16 @@ ul, ol {
 
   .sos-modal {
     padding: var(--spacing-24);
+  }
+}
+
+/* The desktop nav row only collapses to a hamburger below 768px, so between
+   roughly 900 and 1180px it has to carry all eight links at once. Tightening the
+   gap there is what keeps them on a single line instead of wrapping under the
+   logo. Measured at 1024px: 28px gaps overflow by ~57px, 16px gaps fit. */
+@media (max-width: 1180px) {
+  .navbar__links {
+    gap: var(--spacing-16);
   }
 }
 
@@ -2534,6 +2553,1094 @@ ul, ol {
   .sc-results {
     opacity: 1;
     transform: none;
+    transition: none;
+  }
+}
+
+
+/* --------------------------------------------------------------------------
+   25. Component: Drone Medicine Delivery (/drone)
+   --------------------------------------------------------------------------
+   Two constraints shape everything here:
+
+   1. Telemetry updates once a second. Every numeric readout is
+      `font-variant-numeric: tabular-nums` inside a fixed-height row, so a
+      changing digit can never reflow the panel underneath it.
+
+   2. No JS drives layout. The drone marker is moved imperatively by Leaflet
+      (see components/DroneDeliveryMap.js) and everything else animates in CSS,
+      so the 60fps path never touches React or the box model.
+   -------------------------------------------------------------------------- */
+
+/* The navbar is position:fixed, so the page shell has to reserve its height —
+   the same calc .prescription-page and .camp-form-page use. Without it the
+   content slides underneath the bar. */
+.drn-page {
+  padding-top: calc(var(--navbar-height) + var(--spacing-40));
+  padding-bottom: var(--spacing-80);
+  min-height: 100vh;
+}
+
+.drn-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--spacing-16);
+  flex-wrap: wrap;
+  margin-bottom: var(--spacing-24);
+}
+
+.drn-header__title {
+  font-family: var(--font-source-sans);
+  font-size: var(--text-heading-sm);
+  line-height: var(--leading-heading-sm);
+  letter-spacing: var(--tracking-heading-sm);
+  font-weight: var(--font-weight-bold);
+  color: var(--color-bone-white);
+  margin-bottom: var(--spacing-4);
+}
+
+/* ---- Phase stepper ---- */
+
+.drn-phase-steps {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  flex-wrap: wrap;
+  margin-bottom: var(--spacing-24);
+}
+
+.drn-phase-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-caption);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-fog-gray);
+  opacity: 0.5;
+}
+
+.drn-phase-step--active {
+  opacity: 1;
+  color: var(--color-spectral-cyan);
+}
+
+.drn-phase-step--done {
+  opacity: 0.85;
+  color: rgb(52, 237, 179);
+}
+
+.drn-phase-step__num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+  font-size: 11px;
+}
+
+.drn-phase-arrow {
+  color: var(--color-fog-gray);
+  opacity: 0.35;
+}
+
+/* ---- Layout ---- */
+
+.drn-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: var(--spacing-24);
+  align-items: start;
+}
+
+.drn-sim,
+.drn-side {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-16);
+}
+
+/* ---- Provenance banner (order arrived from chat or a prescription) ---- */
+
+.drn-source-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-12);
+  padding: var(--spacing-12) var(--spacing-16);
+  border-radius: var(--radius-cards);
+  border: 1px solid rgba(106, 228, 255, 0.3);
+  background: rgba(106, 228, 255, 0.08);
+  font-size: var(--text-body-sm);
+  line-height: var(--leading-body-sm);
+  color: var(--color-fog-gray);
+}
+
+.drn-source-banner--rx {
+  border-color: rgba(52, 237, 179, 0.3);
+  background: rgba(52, 237, 179, 0.08);
+}
+
+.drn-source-banner__icon {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.drn-source-banner strong {
+  color: var(--color-bone-white);
+}
+
+/* ---- Disclaimer ----
+   This is a simulation, and an offline-first medical app must never let a user
+   believe real medicine is on its way. The disclaimer appears on every phase,
+   not just the first. */
+
+.drn-disclaimer {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-8);
+  padding: var(--spacing-12) var(--spacing-16);
+  border-radius: var(--radius-cards);
+  border: 1px solid rgba(255, 71, 87, 0.35);
+  background: rgba(255, 71, 87, 0.1);
+  font-size: var(--text-caption);
+  line-height: 1.5;
+  color: var(--color-fog-gray);
+}
+
+.drn-disclaimer strong {
+  color: var(--color-sos-red);
+}
+
+/* ---- Catalogue ---- */
+
+.drn-catalog {
+  background: var(--color-tide-card);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-cards);
+  padding: var(--card-padding);
+}
+
+.drn-search {
+  width: 100%;
+  padding: 10px 14px;
+  margin-bottom: var(--spacing-12);
+  border-radius: var(--radius-links);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--color-bone-white);
+  font-family: inherit;
+  font-size: var(--text-body-sm);
+}
+
+.drn-search:focus {
+  outline: 2px solid var(--color-spectral-cyan);
+  outline-offset: 1px;
+}
+
+.drn-cat-tabs {
+  display: flex;
+  gap: var(--spacing-8);
+  overflow-x: auto;
+  padding-bottom: var(--spacing-8);
+  margin-bottom: var(--spacing-12);
+  scrollbar-width: thin;
+}
+
+.drn-cat-tab {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: var(--radius-badges);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--color-fog-gray);
+  font-family: inherit;
+  font-size: var(--text-caption);
+  font-weight: var(--font-weight-semibold);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), color var(--transition-fast), background var(--transition-fast);
+}
+
+.drn-cat-tab--active {
+  border-color: var(--color-spectral-cyan);
+  color: var(--color-spectral-cyan);
+  background: rgba(106, 228, 255, 0.1);
+}
+
+.drn-item-list {
+  display: grid;
+  gap: var(--spacing-8);
+  max-height: 420px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+/* A selected item changes border colour and background only — never padding or
+   border-width — so toggling one cannot reflow the list under the user's thumb. */
+.drn-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--spacing-12);
+  align-items: center;
+  padding: var(--spacing-12);
+  border-radius: var(--radius-links);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.2);
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.drn-item--selected {
+  border-color: var(--color-spectral-cyan);
+  background: rgba(106, 228, 255, 0.07);
+}
+
+.drn-item--out {
+  opacity: 0.45;
+}
+
+.drn-item__name {
+  font-size: var(--text-body-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-bone-white);
+}
+
+.drn-item__bn {
+  font-size: var(--text-caption);
+  color: var(--color-spectral-cyan);
+  margin-top: 1px;
+}
+
+.drn-item__use {
+  font-size: var(--text-caption);
+  color: var(--color-fog-gray);
+  margin-top: 4px;
+  line-height: 1.45;
+}
+
+.drn-item__caution {
+  font-size: 11px;
+  color: rgba(255, 71, 87, 0.9);
+  margin-top: 4px;
+  line-height: 1.45;
+}
+
+.drn-item__meta {
+  font-size: 11px;
+  color: var(--color-fog-gray);
+  opacity: 0.7;
+  margin-top: 4px;
+}
+
+.drn-item__rx {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 2px 8px;
+  border-radius: var(--radius-badges);
+  background: rgba(52, 237, 179, 0.15);
+  border: 1px solid rgba(52, 237, 179, 0.4);
+  color: rgb(52, 237, 179);
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+}
+
+/* ---- Quantity stepper ---- */
+
+.drn-qty {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: var(--radius-badges);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  overflow: hidden;
+}
+
+.drn-qty__btn {
+  width: 30px;
+  height: 30px;
+  border: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--color-bone-white);
+  font-family: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.drn-qty__btn:hover:not(:disabled) {
+  background: rgba(106, 228, 255, 0.2);
+}
+
+.drn-qty__btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.drn-qty__value {
+  min-width: 30px;
+  text-align: center;
+  font-size: var(--text-body-sm);
+  font-weight: var(--font-weight-bold);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-bone-white);
+}
+
+.drn-add-btn {
+  padding: 7px 16px;
+  border-radius: var(--radius-badges);
+  border: 1px solid var(--color-spectral-cyan);
+  background: transparent;
+  color: var(--color-spectral-cyan);
+  font-family: inherit;
+  font-size: var(--text-caption);
+  font-weight: var(--font-weight-semibold);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.drn-add-btn:hover {
+  background: var(--color-spectral-cyan);
+  color: var(--color-abyss-navy);
+}
+
+/* ---- Cart ---- */
+
+.drn-cart {
+  background: var(--color-tide-card);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-cards);
+  padding: var(--card-padding);
+}
+
+.drn-cart__row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: var(--spacing-12);
+  padding: var(--spacing-8) 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.drn-cart__row:last-of-type {
+  border-bottom: none;
+}
+
+.drn-cart__empty {
+  font-size: var(--text-body-sm);
+  color: var(--color-fog-gray);
+  opacity: 0.75;
+  padding: var(--spacing-12) 0;
+}
+
+.drn-cart__unmatched {
+  margin-top: var(--spacing-12);
+  padding: var(--spacing-12);
+  border-radius: var(--radius-links);
+  border: 1px dashed rgba(255, 255, 255, 0.18);
+  background: rgba(0, 0, 0, 0.2);
+  font-size: var(--text-caption);
+  color: var(--color-fog-gray);
+  line-height: 1.5;
+}
+
+.drn-remove {
+  border: none;
+  background: transparent;
+  color: var(--color-sos-red);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: var(--radius-inputs);
+}
+
+.drn-remove:hover {
+  background: rgba(255, 71, 87, 0.15);
+}
+
+/* ---- Payload meter ---- */
+
+.drn-payload {
+  margin-top: var(--spacing-16);
+}
+
+.drn-payload__head {
+  display: flex;
+  justify-content: space-between;
+  font-size: var(--text-caption);
+  color: var(--color-fog-gray);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 6px;
+}
+
+.drn-payload__bar {
+  height: 8px;
+  border-radius: var(--radius-badges);
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.drn-payload__fill {
+  height: 100%;
+  border-radius: var(--radius-badges);
+  background: var(--gradient-yield);
+  transition: width var(--transition-base);
+}
+
+.drn-payload--over .drn-payload__fill {
+  background: var(--color-sos-red);
+}
+
+.drn-payload--over .drn-payload__head {
+  color: var(--color-sos-red);
+}
+
+/* ---- Hub card ---- */
+
+.drn-hub-card {
+  background: var(--color-tide-card);
+  border: 1px solid rgba(106, 228, 255, 0.25);
+  border-radius: var(--radius-cards);
+  padding: var(--card-padding);
+}
+
+.drn-hub-card--unreachable {
+  border-color: rgba(255, 71, 87, 0.35);
+}
+
+.drn-hub-card__label {
+  font-size: var(--text-caption);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-fog-gray);
+  opacity: 0.8;
+  margin-bottom: 6px;
+}
+
+.drn-hub-card__name {
+  font-size: var(--text-body-lg);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-bone-white);
+  line-height: 1.3;
+}
+
+.drn-hub-card__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-16);
+  margin-top: var(--spacing-12);
+}
+
+.drn-hub-card__fact {
+  font-size: var(--text-caption);
+  color: var(--color-fog-gray);
+}
+
+.drn-hub-card__fact strong {
+  display: block;
+  font-size: var(--text-body);
+  color: var(--color-spectral-cyan);
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+
+/* ---- Map ---- */
+
+.drn-map {
+  position: relative;
+  height: 460px;
+  border-radius: var(--radius-cards);
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--color-abyss-navy);
+}
+
+.drn-map__canvas {
+  width: 100%;
+  height: 100%;
+}
+
+.drn-map__offline {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 500;
+  max-width: calc(100% - 24px);
+  padding: 8px 12px;
+  border-radius: var(--radius-links);
+  background: rgba(23, 32, 46, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-fog-gray);
+}
+
+.drn-map__follow {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 500;
+  padding: 7px 14px;
+  border-radius: var(--radius-badges);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(23, 32, 46, 0.92);
+  color: var(--color-fog-gray);
+  font-family: inherit;
+  font-size: var(--text-caption);
+  font-weight: var(--font-weight-semibold);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.drn-map__follow--on {
+  border-color: var(--color-spectral-cyan);
+  color: var(--color-spectral-cyan);
+}
+
+.drn-map__legend {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  z-index: 500;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 12px;
+  border-radius: var(--radius-links);
+  background: rgba(23, 32, 46, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 11px;
+  color: var(--color-fog-gray);
+}
+
+/* Simulated, not dispatched: shown when an order is queued offline and the
+   flight is only a preview. Must be impossible to miss. */
+.drn-map__ribbon {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  z-index: 600;
+  padding: 6px 12px;
+  text-align: center;
+  background: rgba(255, 71, 87, 0.92);
+  color: var(--color-bone-white);
+  font-size: 11px;
+  font-weight: var(--font-weight-bold);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* ---- Map markers ---- */
+
+.drn-marker-drone,
+.drn-marker-hub,
+.drn-marker-dest {
+  background: transparent !important;
+  border: none !important;
+}
+
+.drn-marker-drone__body {
+  font-size: 22px;
+  line-height: 1;
+  /* Heading is written by the rAF loop as a CSS custom property so the marker
+     turns without setIcon() rebuilding DOM 60 times a second. */
+  transform: rotate(var(--drn-rot, 0deg));
+  transform-origin: 50% 50%;
+  filter: drop-shadow(0 0 6px rgba(106, 228, 255, 0.9));
+}
+
+.drn-marker-drone__rotor {
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  border: 1px solid rgba(106, 228, 255, 0.55);
+  animation: droneRotor 1.4s linear infinite;
+}
+
+.drn-marker-hub__ring,
+.drn-marker-dest__ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: rgba(106, 228, 255, 0.25);
+}
+
+.drn-marker-hub--active .drn-marker-hub__ring {
+  animation: pulseRadar 2s ease-out infinite;
+}
+
+.drn-marker-dest__ring {
+  background: rgba(52, 237, 179, 0.28);
+  animation: pulseRadar 2.4s ease-out infinite;
+}
+
+.drn-marker-label {
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  transform: translateX(-50%);
+  margin-top: 2px;
+  padding: 1px 6px;
+  border-radius: var(--radius-inputs);
+  background: rgba(23, 32, 46, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: var(--color-fog-gray);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+@keyframes droneRotor {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* ---- Telemetry panel ---- */
+
+.drn-telemetry {
+  background: var(--color-tide-card);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-cards);
+  padding: var(--card-padding);
+}
+
+.drn-eta {
+  text-align: center;
+  padding-bottom: var(--spacing-16);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: var(--spacing-16);
+}
+
+.drn-eta__label {
+  font-size: var(--text-caption);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-fog-gray);
+  opacity: 0.8;
+}
+
+.drn-eta__value {
+  font-family: var(--font-source-sans);
+  font-size: var(--text-heading-sm);
+  line-height: 1.15;
+  font-weight: var(--font-weight-bold);
+  color: var(--color-spectral-cyan);
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+
+.drn-eta__sub {
+  font-size: var(--text-caption);
+  color: var(--color-fog-gray);
+  font-variant-numeric: tabular-nums;
+  margin-top: 4px;
+}
+
+.drn-scale-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: var(--spacing-8);
+  padding: 2px 10px;
+  border-radius: var(--radius-badges);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--color-fog-gray);
+  font-size: 11px;
+}
+
+.drn-progress {
+  height: 8px;
+  border-radius: var(--radius-badges);
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  margin-bottom: var(--spacing-16);
+}
+
+.drn-progress__fill {
+  height: 100%;
+  border-radius: var(--radius-badges);
+  background: var(--gradient-yield);
+  transition: width 1s linear;
+}
+
+.drn-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--spacing-12);
+}
+
+.drn-stat {
+  padding: var(--spacing-12);
+  border-radius: var(--radius-links);
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.drn-stat__label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-fog-gray);
+  opacity: 0.8;
+}
+
+/* Fixed line-height + tabular figures: a changing digit never nudges layout. */
+.drn-stat__value {
+  font-size: var(--text-body-lg);
+  line-height: 1.4;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-bone-white);
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+
+.drn-battery {
+  margin-top: var(--spacing-16);
+}
+
+.drn-battery__head {
+  display: flex;
+  justify-content: space-between;
+  font-size: var(--text-caption);
+  color: var(--color-fog-gray);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 6px;
+}
+
+.drn-battery__bar {
+  height: 6px;
+  border-radius: var(--radius-badges);
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.drn-battery__fill {
+  height: 100%;
+  border-radius: var(--radius-badges);
+  background: rgb(52, 237, 179);
+  transition: width 1s linear;
+}
+
+.drn-battery--low .drn-battery__fill {
+  background: var(--color-sos-red);
+}
+
+.drn-battery--low .drn-battery__head {
+  color: var(--color-sos-red);
+}
+
+/* ---- Stage timeline ---- */
+
+.drn-timeline {
+  margin-top: var(--spacing-20);
+  padding-top: var(--spacing-16);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-12);
+}
+
+.drn-stage {
+  display: grid;
+  grid-template-columns: 24px 1fr auto;
+  align-items: center;
+  gap: var(--spacing-12);
+  opacity: 0.45;
+  transition: opacity var(--transition-base);
+}
+
+.drn-stage--done {
+  opacity: 0.9;
+}
+
+.drn-stage--active {
+  opacity: 1;
+}
+
+.drn-stage__dot {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.drn-stage--done .drn-stage__dot {
+  background: rgba(52, 237, 179, 0.18);
+  border-color: rgba(52, 237, 179, 0.55);
+}
+
+.drn-stage--active .drn-stage__dot {
+  background: rgba(106, 228, 255, 0.2);
+  border-color: var(--color-spectral-cyan);
+  animation: pulseGlow 1.8s ease-in-out infinite;
+}
+
+.drn-stage__label {
+  font-size: var(--text-body-sm);
+  color: var(--color-fog-gray);
+}
+
+.drn-stage--active .drn-stage__label {
+  color: var(--color-bone-white);
+  font-weight: var(--font-weight-semibold);
+}
+
+.drn-stage__time {
+  font-size: 11px;
+  color: var(--color-fog-gray);
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+}
+
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(106, 228, 255, 0.5); }
+  50% { box-shadow: 0 0 0 6px rgba(106, 228, 255, 0); }
+}
+
+/* ---- Alerts & state chips ---- */
+
+.drn-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-8);
+  padding: var(--spacing-12) var(--spacing-16);
+  border-radius: var(--radius-cards);
+  font-size: var(--text-body-sm);
+  line-height: 1.5;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--color-fog-gray);
+}
+
+.drn-alert--warn {
+  border-color: rgba(255, 193, 7, 0.4);
+  background: rgba(255, 193, 7, 0.1);
+}
+
+.drn-alert--error {
+  border-color: rgba(255, 71, 87, 0.4);
+  background: rgba(255, 71, 87, 0.1);
+}
+
+.drn-alert--ok {
+  border-color: rgba(52, 237, 179, 0.4);
+  background: rgba(52, 237, 179, 0.1);
+}
+
+.drn-alert a {
+  color: var(--color-spectral-cyan);
+}
+
+.drn-offline-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: var(--radius-badges);
+  background: rgba(255, 193, 7, 0.15);
+  border: 1px solid rgba(255, 193, 7, 0.4);
+  color: rgb(255, 193, 7);
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+}
+
+/* ---- Shared CTA card (rendered inside /chat and /prescription) ---- */
+
+.drn-cta-card {
+  margin-top: var(--spacing-16);
+  padding: var(--spacing-16);
+  border-radius: var(--radius-cards);
+  border: 1px solid rgba(106, 228, 255, 0.3);
+  background: linear-gradient(135deg, rgba(106, 228, 255, 0.1), rgba(52, 237, 179, 0.06));
+}
+
+.drn-cta-card__title {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  font-size: var(--text-body);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-bone-white);
+  margin-bottom: 6px;
+}
+
+.drn-cta-card__rationale {
+  font-size: var(--text-body-sm);
+  line-height: 1.5;
+  color: var(--color-fog-gray);
+  margin-bottom: var(--spacing-12);
+}
+
+.drn-cta-card__kit {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: var(--spacing-12);
+}
+
+.drn-cta-card__chip {
+  padding: 3px 10px;
+  border-radius: var(--radius-badges);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: var(--color-bone-white);
+  font-size: var(--text-caption);
+}
+
+.drn-cta-card__note {
+  font-size: 11px;
+  color: var(--color-fog-gray);
+  opacity: 0.8;
+  margin-top: var(--spacing-8);
+  line-height: 1.45;
+}
+
+/* ---- Form bits on the confirm phase ---- */
+
+.drn-field {
+  margin-bottom: var(--spacing-16);
+}
+
+.drn-field__label {
+  display: block;
+  font-size: var(--text-caption);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-fog-gray);
+  margin-bottom: 6px;
+}
+
+.drn-field input,
+.drn-field textarea {
+  width: 100%;
+  padding: 10px 14px;
+  border-radius: var(--radius-links);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--color-bone-white);
+  font-family: inherit;
+  font-size: var(--text-body-sm);
+}
+
+.drn-field input:focus,
+.drn-field textarea:focus {
+  outline: 2px solid var(--color-spectral-cyan);
+  outline-offset: 1px;
+}
+
+.drn-field__error {
+  font-size: 11px;
+  color: var(--color-sos-red);
+  margin-top: 4px;
+}
+
+.drn-scale-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  flex-wrap: wrap;
+}
+
+.drn-scale-btn {
+  padding: 6px 14px;
+  border-radius: var(--radius-badges);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--color-fog-gray);
+  font-family: inherit;
+  font-size: var(--text-caption);
+  font-weight: var(--font-weight-semibold);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.drn-scale-btn--active {
+  border-color: var(--color-spectral-cyan);
+  color: var(--color-spectral-cyan);
+  background: rgba(106, 228, 255, 0.1);
+}
+
+.drn-actions {
+  display: flex;
+  gap: var(--spacing-12);
+  flex-wrap: wrap;
+  margin-top: var(--spacing-16);
+}
+
+.drn-actions .btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ---- Responsive ---- */
+
+@media (max-width: 900px) {
+  .drn-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .drn-map {
+    height: 320px;
+  }
+
+  .drn-item-list {
+    max-height: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .drn-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .drn-item__actions {
+    justify-self: start;
+  }
+
+  .drn-stat-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .drn-header__title {
+    font-size: var(--text-subheading);
+  }
+}
+
+/* Respect a reduced-motion setting. The information still arrives — the drone
+   still moves, just stepped once a second from the telemetry prop instead of
+   the requestAnimationFrame loop (components/DroneDeliveryMap.js reads the same
+   media query and skips the loop entirely). */
+@media (prefers-reduced-motion: reduce) {
+  .drn-marker-drone__body {
+    transform: none;
+  }
+
+  .drn-marker-drone__rotor,
+  .drn-marker-hub--active .drn-marker-hub__ring,
+  .drn-marker-dest__ring,
+  .drn-stage--active .drn-stage__dot {
+    animation: none;
+  }
+
+  .drn-progress__fill,
+  .drn-battery__fill,
+  .drn-payload__fill,
+  .drn-stage {
     transition: none;
   }
 }

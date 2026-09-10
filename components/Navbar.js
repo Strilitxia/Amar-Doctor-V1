@@ -8,10 +8,11 @@ const NAV_LINKS = [
   { href: "/", label: "Home", labelBn: "হোম" },
   { href: "/chat", label: "AI Doctor", labelBn: "এআই ডাক্তার" },
   { href: "/symptoms", label: "Offline Care", labelBn: "অফলাইন চিকিৎসা" },
-  { href: "/symptoms/finder", label: "⚡ Symptom Checker", labelBn: "⚡ লক্ষণ পরীক্ষা" },
-  { href: "/map", label: "Medical Camps", labelBn: "মেডিকেল ক্যাম্প" },
+  { href: "/symptoms/finder", label: "⚡ Checker", labelBn: "⚡ লক্ষণ" },
+  { href: "/map", label: "Camps", labelBn: "ক্যাম্প" },
   { href: "/prescription", label: "Prescription", labelBn: "প্রেসক্রিপশন" },
-  { href: "/emergency", label: "SOS Command", labelBn: "জরুরি কন্ট্রোল" },
+  { href: "/drone", label: "🚁 Drone Rx", labelBn: "🚁 ড্রোন ওষুধ" },
+  { href: "/emergency", label: "SOS", labelBn: "জরুরি" },
 ];
 
 export default function Navbar() {

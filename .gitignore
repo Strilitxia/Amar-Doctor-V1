@@ -52,3 +52,6 @@ next-env.d.ts
 
 # medical camp store written at runtime by app/api/camps/route.js
 /data/medical-camps.json
+
+# drone delivery store written at runtime by app/api/drone/orders/route.js
+/data/drone-orders.json

@@ -37,6 +37,14 @@ const FEATURES = [
     linkText: "Scan Prescription",
   },
   {
+    icon: "🚁",
+    title: "Drone Medicine Delivery",
+    titleBn: "ড্রোন ওষুধ ডেলিভারি",
+    desc: "Order essential medicines from the nearest medical support centre, or let the AI doctor build the kit from your consultation. Watch the drone fly to your live GPS location with real-time distance, ETA and battery — the catalogue and flight plan work fully offline.",
+    href: "/drone",
+    linkText: "Request a Delivery",
+  },
+  {
     icon: "⛑️",
     title: "NGO Medical Camp Finder",
     titleBn: "এনজিও মেডিকেল ক্যাম্প ম্যাপ",

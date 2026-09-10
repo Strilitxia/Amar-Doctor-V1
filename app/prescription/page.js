@@ -4,6 +4,7 @@ import { useState, useRef } from "react";
 import Navbar from "@/components/Navbar";
 import Footer from "@/components/Footer";
 import SOSButton from "@/components/SOSButton";
+import DroneDeliveryCTA from "@/components/DroneDeliveryCTA";
 
 export default function PrescriptionPage() {
   const [image, setImage] = useState(null);
@@ -194,6 +195,12 @@ export default function PrescriptionPage() {
                       <p className="text-body-sm text-muted">{results.summary}</p>
                     </div>
                   )}
+
+                  {/* Carry the scanned medicines straight into a drone order.
+                      This is the only path by which a prescription-only drug can
+                      ever be delivered — the manual picker on /drone never shows
+                      them, and the API re-checks the provenance. */}
+                  <DroneDeliveryCTA source="prescription" medications={results.medications} />
 
                   {/* Medications */}
                   {results.medications?.map((med, i) => (

@@ -7,6 +7,10 @@ const OFFLINE_URLS = [
   "/symptoms/finder",
   "/chat",
   "/prescription",
+  // The medicine catalogue, hub network and flight maths are all module-level
+  // literals, so the whole compose flow works with no network once this route
+  // and its chunk are cached.
+  "/drone",
   "/map",
   "/camps/new",
   "/emergency",

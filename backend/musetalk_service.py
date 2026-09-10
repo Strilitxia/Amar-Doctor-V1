@@ -47,6 +47,7 @@ import logging
 import math
 import os
 import pickle
+import platform
 import shutil
 import subprocess
 import sys
@@ -65,9 +66,39 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("musetalk-service")
 
 # ─── Locate MuseTalk + ffmpeg (env-configurable; defaults match MUSETALK_SETUP.md) ───
-MUSETALK_ROOT = Path(os.environ.get("MUSETALK_ROOT", r"D:\ai\MuseTalk")).resolve()
-FFMPEG_DIR = Path(os.environ.get("FFMPEG_PATH", r"D:\ai\ffmpeg\bin")).resolve()
-FFMPEG_EXE = FFMPEG_DIR / "ffmpeg.exe"
+_IS_WINDOWS = platform.system() == "Windows"
+_FFMPEG_BIN_NAME = "ffmpeg.exe" if _IS_WINDOWS else "ffmpeg"
+
+
+def _default_musetalk_root() -> str:
+    # Windows local dev matches MUSETALK_SETUP.md's D:\ai\MuseTalk. On
+    # anything else (Colab/Linux) there is no sane machine-specific default,
+    # so fall back to a path under the repo's sibling -- colab_runner.py
+    # always sets MUSETALK_ROOT explicitly anyway; this only matters if
+    # someone runs the sidecar by hand without setting it.
+    return r"D:\ai\MuseTalk" if _IS_WINDOWS else "/content/MuseTalk"
+
+
+def _default_ffmpeg_dir() -> Path:
+    """Locate a directory containing an `ffmpeg` (or `ffmpeg.exe`) binary.
+
+    Windows has no system ffmpeg by convention, so MUSETALK_SETUP.md has you
+    copy imageio-ffmpeg's bundled binary to D:\\ai\\ffmpeg\\bin\\ffmpeg.exe --
+    that stays the default here. Colab and most Linux boxes already have a
+    real `ffmpeg` on PATH (Colab installs it via apt), so there prefer
+    whatever `shutil.which` finds over guessing a path that may not exist.
+    """
+    if _IS_WINDOWS:
+        return Path(r"D:\ai\ffmpeg\bin")
+    found = shutil.which("ffmpeg")
+    if found:
+        return Path(found).resolve().parent
+    return Path("/usr/bin")
+
+
+MUSETALK_ROOT = Path(os.environ.get("MUSETALK_ROOT", _default_musetalk_root())).resolve()
+FFMPEG_DIR = Path(os.environ.get("FFMPEG_PATH") or _default_ffmpeg_dir()).resolve()
+FFMPEG_EXE = FFMPEG_DIR / _FFMPEG_BIN_NAME
 
 # The doctor asset. Prefer a short clip (natural micro-movement) over a
 # still -- see backend/static/AVATAR.md. Both live outside this file's own
@@ -96,7 +127,7 @@ sys.path.insert(0, str(MUSETALK_ROOT))
 if FFMPEG_EXE.exists():
     os.environ["PATH"] = f"{FFMPEG_DIR}{os.pathsep}{os.environ['PATH']}"
 else:
-    logger.warning(f"ffmpeg.exe not found at {FFMPEG_EXE} -- rendering will fail.")
+    logger.warning(f"{_FFMPEG_BIN_NAME} not found at {FFMPEG_EXE} -- rendering will fail.")
 
 import imageio_ffmpeg  # noqa: E402
 

@@ -164,7 +164,7 @@ export default function SymptomCheckerPage() {
   return (
     <>
       <Navbar />
-      <div className="symptoms-finder-page" style={{ paddingBottom: 80, paddingTop: 30 }}>
+      <div className="symptoms-finder-page" style={{ paddingBottom: 80 }}>
         <div className="page-container" style={{ maxWidth: 860 }}>
           {/* Page header */}
           <div className="text-center" style={{ marginBottom: 32 }}>

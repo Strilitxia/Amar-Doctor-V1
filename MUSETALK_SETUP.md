@@ -8,6 +8,13 @@ Everything here installs into isolated virtualenvs and a directory outside the
 repo. **Your system Python and the project's existing `venv/` are never
 touched.** Teardown is deleting two folders.
 
+**This page is the local Windows recipe.** Running the backend on Google Colab
+instead? Use [`backend/amar_doctor_colab.ipynb`](backend/amar_doctor_colab.ipynb) —
+same isolation strategy (separate Python 3.10 venv, same mmcv/chumpy fixes),
+translated to Colab's Linux runtime with a Drive-cache step so the ~7GB install
+survives a session restart. `backend/colab_runner.py` starts it automatically
+alongside the main backend if that notebook's install cell has been run.
+
 ---
 
 ## Why a separate process
@@ -364,6 +371,7 @@ avatar.
 | `backend/musetalk_stub.py` (protocol stub) | done |
 | Steps 1–6 (env + weights) | **done** — `D:\ai\musetalk-venv`, `D:\ai\MuseTalk`, 7.3GB of weights, gate test passed on MuseTalk's own sample data |
 | `backend/musetalk_service.py` (the real renderer) | **done and verified end-to-end**: real Bengali TTS → real GPU render → real `av_chunk` → real fetchable `/api/media` clip → confirmed valid H.264+AAC → confirmed genuine lip motion by inspecting extracted frames |
+| Colab support (`backend/amar_doctor_colab.ipynb` + `colab_runner.py`) | done — same isolated-venv strategy, Drive-cached weights; **not yet run on an actual Colab instance** (no live Colab access during development), so treat the mmcv/wheel step as somewhat less battle-tested there than the Windows path above, which was run for real |
 
 **What "verified end-to-end" means concretely:** a raw WebSocket client sent
 the exact `/ws/voice-call` payload the browser sends (`want_video: true`),
@@ -394,23 +402,24 @@ tile with the doctor mid-speech.
 - `backend/static/AVATAR_SOURCE.txt` (licence provenance for the portrait) —
   the portrait and idle clip are in place, but the source/licence note isn't.
 
-## What's running right now (left up for you to try)
+## Starting it locally, day to day
 
-| Service | Port | Command it was started with |
-|---|---|---|
-| MuseTalk sidecar | 8100 | `D:\ai\musetalk-venv\Scripts\python.exe -m uvicorn musetalk_service:app --host 127.0.0.1 --port 8100` (from `backend/`) |
-| Main backend | 8000 | `MUSETALK_SIDECAR_URL=http://127.0.0.1:8100` then `venv\Scripts\python.exe -m uvicorn backend.server:app --host 127.0.0.1 --port 8000` |
-| Next.js | 3000 | `npm run dev` |
+```powershell
+.\start-all.ps1
+```
 
-`(Invoke-RestMethod http://localhost:8000/health).lipsync` should show
-`live: true, engine: "musetalk-v15"` right now. Open `/chat`, pick **📹 Video
-Call**, and the badge should already read green. A reply will take a while
-(see Latency above) — that's real, not a hang.
+Starts the renderer, backend and web (skipping any already running), waits
+for each, and finishes by printing whether video will actually work:
 
-To stop everything: find each `python.exe`/`node.exe` holding ports
-8100/8000/3000 (`netstat -ano | findstr :8100` etc. in PowerShell) and
-`Stop-Process -Id <pid> -Force`, or just close the terminal windows if you
-restart them yourself later with the commands above.
+```
+Lip-sync: LIVE (musetalk-v15)          <- GPU lip-sync
+Lip-sync: OFF (reason: unreachable)    <- renderer not up; audio-reactive avatar instead
+```
+
+`.\start-all.ps1 -Stop` stops all three; `-NoVideo` skips the renderer on
+purpose. Logs land in `.logs\`. See "The easy way" under §7 above for the
+same instructions with more detail, and the manual three-terminal commands if
+you'd rather not use the script.
 
 ## Implementation notes (for anyone touching `musetalk_service.py`)
 
