@@ -112,19 +112,32 @@ def start_musetalk_sidecar():
     # of loading the weights -- give it real time before giving up, matching
     # start-all.ps1's own patience on the local path.
     deadline_polls = 150  # ~5 minutes at 2s/poll
+    last = None
     for _ in range(deadline_polls):
         try:
             r = requests.get("http://127.0.0.1:8100/health", timeout=2)
-            if r.ok and r.json().get("ok"):
-                print("✓ MuseTalk renderer ready (musetalk-v15). Video calls get real GPU lip-sync.")
-                return proc
+            if r.ok:
+                last = r.json()
+                if last.get("ok"):
+                    print("✓ MuseTalk renderer ready (musetalk-v15). Video calls get real GPU lip-sync.")
+                    return proc
+                # The sidecar answers /health as soon as its startup hook
+                # finishes -- success or failure. If it's answering with
+                # ok=false, loading is DONE and has failed; waiting the
+                # remaining minutes out would only hide that.
+                if last.get("error"):
+                    break
         except requests.RequestException:
             pass
         time.sleep(2)
 
-    print("⚠️  MuseTalk renderer did not become ready in time.")
+    print("⚠️  MuseTalk renderer failed to become ready.")
+    if last and last.get("error"):
+        print(f"    Sidecar error: {last['error']}")
+        print("    (full traceback is in this cell's output above, under 'Model load failed')")
+    else:
+        print("    It never answered /health. Check this cell's output above for its startup errors.")
     print("    Video calls will fall back to the audio-reactive avatar for now.")
-    print("    Check its own output above for the actual error, or re-run once it settles.")
     return proc
 
 

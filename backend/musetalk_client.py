@@ -53,8 +53,9 @@ class MuseTalkClient:
         self._health: Optional[dict] = None
         self._health_at = 0.0
         # The "sidecar is down" guidance is worth saying loudly once, not on
-        # every 15s health-cache miss.
+        # every 15s health-cache miss. Same for a load error.
         self._warned_unreachable = False
+        self._logged_error = False
 
     @property
     def configured(self) -> bool:
@@ -121,12 +122,27 @@ class MuseTalkClient:
 
         avatar_ready = bool(data.get("avatar_ready"))
         device = data.get("device")
-        if not avatar_ready:
+        sidecar_ok = data.get("ok", True)
+        sidecar_error = data.get("error") or None
+
+        # A sidecar that failed during model/avatar load answers with
+        # ok=false and its own `error` string. That used to be reported here
+        # as a bare "avatar_not_prepared" with the real message discarded --
+        # which is true but useless, since it's never the actual problem.
+        if not sidecar_ok and sidecar_error:
+            reason = "sidecar_error"
+        elif not avatar_ready:
             reason = "avatar_not_prepared"
         elif device != "cuda":
             reason = "no_cuda"
         else:
             reason = None
+
+        if sidecar_error and not self._logged_error:
+            self._logged_error = True
+            logger.error(f"MuseTalk sidecar failed to load: {sidecar_error}")
+        elif not sidecar_error:
+            self._logged_error = False
 
         result = {
             "live": reason is None,
@@ -134,6 +150,9 @@ class MuseTalkClient:
             "avatar_ready": avatar_ready,
             "device": device,
             "reason": reason,
+            # The sidecar's own exception text, verbatim -- this is the field
+            # to read when reason is anything other than null.
+            "error": sidecar_error,
         }
         self._health, self._health_at = result, now
         return result

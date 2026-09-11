@@ -158,6 +158,10 @@ if ($health.lipsync.live) {
     if ($health.lipsync.reason -eq "unreachable" -and -not $NoVideo) {
         Write-Host "         The renderer isn't answering on :8100 -- see $LogDir\musetalk.err.log" -ForegroundColor Yellow
     }
+    if ($health.lipsync.error) {
+        Write-Host ("         Renderer error: {0}" -f $health.lipsync.error) -ForegroundColor Red
+        Write-Host "         Full traceback: $LogDir\musetalk.err.log" -ForegroundColor Yellow
+    }
 }
 
 Write-Host "`nOpen http://localhost:3000/chat  ->  Video Call  ->  Start Live Call" -ForegroundColor White
