@@ -8,28 +8,42 @@
     to the audio-reactive avatar -- which on screen looks like a still
     portrait, i.e. exactly like the feature is broken.
 
-      1. MuseTalk renderer  :8100  -- isolated py3.10 venv (D:\ai\musetalk-venv)
+      1. MuseTalk renderer  :8100  -- isolated py3.10 venv (<AiHome>\musetalk-venv)
       2. Main backend       :8000  -- project venv (.\venv)
       3. Next.js web        :3000
 
-    Usage:
+    <AiHome> is wherever setup-windows.ps1 put the MuseTalk venv, clone,
+    weights and ffmpeg: by default a folder NEXT TO the repo named
+    amar-doctor-ai. Override with -AiHome or $env:AMAR_AI_HOME.
+
+    Usage (or double-click start-all.cmd):
         .\start-all.ps1              # start whatever isn't already running
         .\start-all.ps1 -NoVideo     # skip the renderer (audio-reactive avatar)
         .\start-all.ps1 -Stop        # stop everything this script starts
 
-    See MUSETALK_SETUP.md for the renderer's one-time install.
+    One-time install: .\setup-windows.ps1  (details in MUSETALK_SETUP.md).
 #>
 
 param(
+    [string]$AiHome = $(if ($env:AMAR_AI_HOME) { $env:AMAR_AI_HOME } else { Join-Path (Split-Path $PSScriptRoot -Parent) "amar-doctor-ai" }),
     [switch]$NoVideo,
     [switch]$Stop
 )
 
 $ErrorActionPreference = "Stop"
 $Repo = $PSScriptRoot
-$MuseTalkVenv = "D:\ai\musetalk-venv\Scripts\python.exe"
+$AiHome = [System.IO.Path]::GetFullPath($AiHome)
+# Pre-setup-script installs (MUSETALK_SETUP.md's manual recipe) used D:\ai.
+if (-not (Test-Path (Join-Path $AiHome "musetalk-venv")) -and (Test-Path "D:\ai\musetalk-venv")) { $AiHome = "D:\ai" }
+$MuseTalkVenv = Join-Path $AiHome "musetalk-venv\Scripts\python.exe"
 $ProjectVenv = Join-Path $Repo "venv\Scripts\python.exe"
 $LogDir = Join-Path $Repo ".logs"
+
+if (-not $Stop -and -not (Test-Path $ProjectVenv)) {
+    Write-Host "Project venv not found at $ProjectVenv" -ForegroundColor Red
+    Write-Host "Run .\setup-windows.ps1 first (or double-click setup-windows.cmd)." -ForegroundColor Red
+    exit 1
+}
 
 function Get-PortPid([int]$Port) {
     $line = netstat -ano | Select-String ":$Port\s.*LISTENING" | Select-Object -First 1
@@ -63,9 +77,12 @@ if ($NoVideo) {
 } elseif (-not (Test-Path $MuseTalkVenv)) {
     Write-Host "[1/3] MuseTalk venv not found at $MuseTalkVenv" -ForegroundColor Red
     Write-Host "      Video calls will fall back to the audio-reactive avatar." -ForegroundColor Red
-    Write-Host "      Install it with MUSETALK_SETUP.md, or pass -NoVideo to skip this warning." -ForegroundColor Red
+    Write-Host "      Run .\setup-windows.ps1 to install it, or pass -NoVideo to skip this warning." -ForegroundColor Red
 } else {
     Write-Host "[1/3] Starting MuseTalk renderer on :8100 ..." -ForegroundColor Cyan
+    # musetalk_service.py reads these; the child process inherits them.
+    $env:MUSETALK_ROOT = Join-Path $AiHome "MuseTalk"
+    $env:FFMPEG_PATH   = Join-Path $AiHome "ffmpeg\bin"
     Start-Process -FilePath $MuseTalkVenv `
         -ArgumentList "-m", "uvicorn", "musetalk_service:app", "--host", "127.0.0.1", "--port", "8100" `
         -WorkingDirectory (Join-Path $Repo "backend") `
@@ -117,7 +134,7 @@ if (-not $health) {
     exit 1
 }
 
-Write-Host ("Whisper : {0} on {1}" -f $health.whisper.model_size, $health.whisper.device)
+Write-Host ("Whisper : {0} on {1} (loaded: {2}) -- if never loaded, use the Web Speech toggle in /chat for the mic" -f $health.whisper.model_size, $health.whisper.device, $health.whisper.loaded)
 
 # The renderer loads ~7GB of weights, so it is normally slower to become
 # ready than the backend -- poll it separately rather than judging too early.

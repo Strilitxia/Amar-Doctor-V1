@@ -44,17 +44,16 @@ def download_cloudflared():
 def _musetalk_paths():
     """Where the notebook's "Install MuseTalk" cell put things.
 
-    MUSETALK_CACHE_ROOT defaults to a plain /content path (wiped when the
-    Colab runtime recycles). The notebook points this at
-    /content/drive/MyDrive/... instead when Drive is mounted, so the ~7GB of
-    weights and the mmcv/mmpose environment survive a session restart instead
-    of reinstalling every time. MUSETALK_ROOT / MUSETALK_VENV_PYTHON override
-    the two derived paths individually, for anyone running this outside the
-    notebook's own convention.
+    Everything lives on Colab's local disk, including the ~7.3GB of weights
+    under <root>/models. Nothing is written to Google Drive: it keeps the
+    install fast and avoids Drive's slow FUSE mount, at the cost of a runtime
+    reset wiping it all. MUSETALK_ROOT / MUSETALK_VENV_PYTHON override either
+    path for anyone running outside the notebook's convention.
     """
-    cache_root = Path(os.environ.get("MUSETALK_CACHE_ROOT", "/content/amar_doctor_musetalk"))
-    musetalk_root = Path(os.environ.get("MUSETALK_ROOT", str(cache_root / "MuseTalk")))
-    venv_python = Path(os.environ.get("MUSETALK_VENV_PYTHON", str(cache_root / "musetalk-venv" / "bin" / "python")))
+    musetalk_root = Path(os.environ.get("MUSETALK_ROOT", "/content/MuseTalk"))
+    venv_python = Path(
+        os.environ.get("MUSETALK_VENV_PYTHON", "/content/musetalk-venv/bin/python")
+    )
     return musetalk_root, venv_python
 
 

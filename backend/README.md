@@ -18,19 +18,21 @@ This directory contains the AI Audio & Video consultation backend for **Amar Doc
 1. Open [Google Colab](https://colab.research.google.com/).
 2. Click **Upload** and upload `backend/amar_doctor_colab.ipynb`.
 3. In Colab menu: **Runtime > Change runtime type > Select T4 GPU**.
-4. Set your `GROQ_API_KEY` in cell 3, then run cells **1, 2, 3, and 7** — that's the full voice
+4. Set your `GROQ_API_KEY` in cell 3, then run cells **1, 2, 3, and 6** — that's the full voice
    pipeline (TTS, Bengali STT, Groq triage) live on a public URL.
-5. **Want real GPU lip-sync too, not the audio-reactive fallback avatar?** Also run cells 4-6:
-   mount Drive (so the ~7GB MuseTalk install survives a session restart), upload a doctor
-   portrait/clip, then run the MuseTalk install cell (~5-10 min the first time, seconds after —
-   it's idempotent, safe to re-run if the runtime drops mid-install).
-6. Copy the generated `https://xxxx.trycloudflare.com` URL from cell 7's output.
+5. **Want real GPU lip-sync too, not the audio-reactive fallback avatar?** Also run cells 4 and 5:
+   upload a doctor portrait/clip, then run the MuseTalk install cell (~10 min, most of it the
+   7.3GB weight download; idempotent, so it's safe to re-run if the runtime drops mid-install).
+6. Copy the generated `https://xxxx.trycloudflare.com` URL from cell 6's output.
 7. Paste the URL into the **Colab Settings** in your Amar Doctor web interface!
 
-Do **not** blindly "Run all" — cells 3, 5 and 6 need your `GROQ_API_KEY` and (for video) a doctor
-asset in place first, and cells 4-6 are entirely skippable if you only want voice calls. See the
-notebook's own cell-by-cell explanations, and [`MUSETALK_SETUP.md`](../MUSETALK_SETUP.md) for what
-each MuseTalk step is actually doing (it's the same recipe as the local Windows install, just
+Everything installs to Colab's local disk — nothing is written to Google Drive. A runtime reset
+therefore wipes the MuseTalk environment and weights, and cells 4-5 have to be re-run.
+
+Do **not** blindly "Run all" — cell 3 needs your `GROQ_API_KEY` and cell 4 needs a doctor asset
+uploaded, and cells 4-5 are entirely skippable if you only want voice calls. See the notebook's
+own cell-by-cell explanations, and [`MUSETALK_SETUP.md`](../MUSETALK_SETUP.md) for what each
+MuseTalk step is actually doing (it's the same recipe as the local Windows install, just
 translated to Colab's Linux runtime).
 
 ---

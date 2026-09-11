@@ -244,6 +244,23 @@ Amar Doctor V1/
 
 ## 💻 Installation & Setup
 
+### Windows — the two-click way (recommended)
+
+Needs an NVIDIA GPU for lip-sync (everything else works without one).
+
+1. **Install once** — double-click `setup-windows.cmd` (or run `.\setup-windows.ps1`).
+   Installs uv/git/Node if missing, `npm install`, the backend venv, the isolated
+   MuseTalk environment and its 7.3 GB of weights, and asks for your `GROQ_API_KEY`.
+   Nothing touches your system Python. AI files go in a folder *next to* the repo
+   (`..\amar-doctor-ai`; override with `-AiHome X:\path`). Safe to re-run — it resumes.
+2. **Run** — double-click `start-all.cmd` (or `.\start-all.ps1`). Starts the renderer,
+   backend and web, and prints `Lip-sync: LIVE` when the video call is really working.
+   `.\start-all.ps1 -Stop` stops everything.
+
+Speech-to-text (Whisper) is deliberately not installed by this path — its Bengali
+accuracy isn't good enough yet. Use the speech-engine toggle in `/chat` (browser Web
+Speech API) for the microphone. Manual steps below are for other setups.
+
 ### Frontend (Next.js)
 
 1. **Clone the repository**:

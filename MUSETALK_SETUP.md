@@ -8,12 +8,20 @@ Everything here installs into isolated virtualenvs and a directory outside the
 repo. **Your system Python and the project's existing `venv/` are never
 touched.** Teardown is deleting two folders.
 
+> **Short version for Windows:** double-click `setup-windows.cmd` once (it runs
+> steps 1–6 below automatically, idempotently, into `..\amar-doctor-ai` next to
+> the repo — or `-AiHome X:\path`), then double-click `start-all.cmd`. The rest
+> of this page explains what that script does and how to do it by hand. Paths
+> below say `D:\ai\...`; the script's default is `<repo parent>\amar-doctor-ai\...`
+> and `start-all.ps1` still recognises an old `D:\ai` install.
+
 **This page is the local Windows recipe.** Running the backend on Google Colab
 instead? Use [`backend/amar_doctor_colab.ipynb`](backend/amar_doctor_colab.ipynb) —
 same isolation strategy (separate Python 3.10 venv, same mmcv/chumpy fixes),
-translated to Colab's Linux runtime with a Drive-cache step so the ~7GB install
-survives a session restart. `backend/colab_runner.py` starts it automatically
-alongside the main backend if that notebook's install cell has been run.
+translated to Colab's Linux runtime. Everything there installs to Colab's local
+disk rather than Google Drive, so a runtime reset means re-running the install
+cell. `backend/colab_runner.py` starts the renderer automatically alongside the
+main backend if that notebook's install cell has been run.
 
 ---
 
@@ -63,8 +71,14 @@ still image.
 ```powershell
 winget install --id=astral-sh.uv -e      # if you don't have uv
 uv python install 3.10
-uv venv --python 3.10 D:\ai\musetalk-venv
+uv venv --python 3.10 --seed D:\ai\musetalk-venv
 ```
+
+`--seed` is not optional. Without it `uv venv` creates an environment with no
+`pip` in it at all, and step 3 below dies on `No module named pip` — `mim`
+shells out to pip, so it cannot work either. `--seed` also installs
+`setuptools` and `wheel`, both needed further down (`chumpy`'s `setup.py`
+cannot build without `wheel`).
 
 Confirm your default Python is untouched — this should still print 3.13:
 
@@ -85,9 +99,10 @@ Order matters: `mim` resolves mmcv against whatever torch is already installed.
 ```powershell
 $PY = "D:\ai\musetalk-venv\Scripts\python.exe"
 
-& $PY -m pip install -U pip
 & $PY -m pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118
 & $PY -m pip install -U openmim
+# mim needs pkg_resources, dropped in setuptools >= 70 (which --seed installs).
+& $PY -m pip install "setuptools<70"
 & $PY -m mim install mmengine
 & $PY -m mim install "mmcv==2.0.1"
 & $PY -m mim install "mmdet==3.1.0"
@@ -371,7 +386,7 @@ avatar.
 | `backend/musetalk_stub.py` (protocol stub) | done |
 | Steps 1–6 (env + weights) | **done** — `D:\ai\musetalk-venv`, `D:\ai\MuseTalk`, 7.3GB of weights, gate test passed on MuseTalk's own sample data |
 | `backend/musetalk_service.py` (the real renderer) | **done and verified end-to-end**: real Bengali TTS → real GPU render → real `av_chunk` → real fetchable `/api/media` clip → confirmed valid H.264+AAC → confirmed genuine lip motion by inspecting extracted frames |
-| Colab support (`backend/amar_doctor_colab.ipynb` + `colab_runner.py`) | done — same isolated-venv strategy, Drive-cached weights; **not yet run on an actual Colab instance** (no live Colab access during development), so treat the mmcv/wheel step as somewhat less battle-tested there than the Windows path above, which was run for real |
+| Colab support (`backend/amar_doctor_colab.ipynb` + `colab_runner.py`) | partly verified — a real Colab run got through ffmpeg, the Python 3.10 venv, and the MuseTalk clone, then failed on `No module named pip` (fixed: `uv venv` needs `--seed`, since it creates a venv with no pip and `mim` shells out to pip). **Everything past that point — the mmcv/mmdet/mmpose installs, the weight download, and the sidecar actually rendering on a T4 — has still not been observed end to end.** Treat those as less battle-tested than the Windows path above, which was run for real. |
 
 **What "verified end-to-end" means concretely:** a raw WebSocket client sent
 the exact `/ws/voice-call` payload the browser sends (`want_video: true`),
